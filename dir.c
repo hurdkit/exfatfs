@@ -672,26 +672,29 @@ report_hidden_names (int hidden)
 	   EXFAT_LISTED_NAME_MAX);
 }
 
+/* A directory is empty when none of its entries is the File entry of
+   a set, whether a lookup would accept that set or not and whether a
+   listing shows its name or not.  Removing the directory frees its
+   clusters, and the clusters of a file left in it would then belong
+   to nothing, damaged as its set may be.  An entry that cannot be
+   told from a File entry counts as one, and a directory that cannot
+   be read is not empty.  */
 int
 diskfs_dirempty (struct node *dp, struct protid *cred)
 {
   error_t err;
   struct exfat_dir dir;
-  struct exfat_set *set = malloc (sizeof *set);
-  bool found = true;
+  const uint8_t *entry = NULL;
 
-  if (!set)
+  if (exfat_dir_open (&dir, &dp->dn->stream, dp == diskfs_root_node))
     return 0;
-  err = exfat_dir_open (&dir, &dp->dn->stream, dp == diskfs_root_node);
-  if (!err)
-    {
-      pthread_rwlock_rdlock (&exfat_entry_lock);
-      err = next_good_set (&dir, set, &found);
-      pthread_rwlock_unlock (&exfat_entry_lock);
-      exfat_dir_close (&dir);
-    }
-  free (set);
-  return !err && !found;
+  pthread_rwlock_rdlock (&exfat_entry_lock);
+  while (!(err = exfat_dir_next_primary (&dir, &entry))
+	 && entry && (entry[0] & EXFAT_TYPE_BENIGN))
+    dir.pos += EXFAT_ENTRY_SIZE;
+  pthread_rwlock_unlock (&exfat_entry_lock);
+  exfat_dir_close (&dir);
+  return !err && !entry;
 }
 
 #define DIRENT_ALIGN	__alignof__ (struct dirent)
