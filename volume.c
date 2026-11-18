@@ -59,13 +59,46 @@ exfat_disk_read (off_t offset, void *buf, size_t len)
 
 /* Whether the main boot sector says that the volume is being written
    from here: VolumeDirty is set and PercentInUse is "not available".
-   And whether VolumeDirty was set when the volume was mounted.
-   Whoever left it set then may have left the volume damaged, which
-   nothing here repairs, so in that case it stays set (section
-   3.1.13.2).  */
+   And whether VolumeDirty was set when the volume was mounted, or
+   something written to the volume since may not have got there.
+   Either may have left the volume damaged, which nothing here
+   repairs, so in that case it stays set (section 3.1.13.2).  */
 static bool volume_in_use;
-static bool volume_dirty_at_mount;
+static bool volume_stays_dirty;
 static pthread_mutex_t volume_dirty_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Set once the store has left the volume in a state that what is
+   kept here of it does not describe.  Nothing is written to it from
+   then on.  */
+static bool volume_failed;
+
+/* Note that the volume may be damaged: VolumeDirty stays set from now
+   on, and the next mount serves the volume read-only.  */
+void
+exfat_volume_damaged (void)
+{
+  pthread_mutex_lock (&volume_dirty_lock);
+  volume_stays_dirty = true;
+  pthread_mutex_unlock (&volume_dirty_lock);
+}
+
+/* Note that the volume is damaged in a way that further writes would
+   make worse, and refuse them from now on.  */
+void
+exfat_volume_failed (void)
+{
+  bool first;
+
+  pthread_mutex_lock (&volume_dirty_lock);
+  first = !volume_failed;
+  volume_failed = volume_stays_dirty = true;
+  pthread_mutex_unlock (&volume_dirty_lock);
+  if (first)
+    error (0, 0, "%s: the store failed while directory entries were"
+	   " being changed, and what was written could not be taken back;"
+	   " nothing more is written to the volume, which fsck.exfat should"
+	   " check", diskfs_disk_name);
+}
 
 /* Whether the volume is read-only for no other reason than that
    VolumeDirty was set when it was mounted.  */
@@ -130,7 +163,7 @@ exfat_volume_mark (bool in_use, bool leaking)
 	err = exfat_disk_read (0, sector, SECTOR_SIZE);
       if (!err)
 	{
-	  bool dirty = in_use || leaking || volume_dirty_at_mount;
+	  bool dirty = in_use || leaking || volume_stays_dirty;
 
 	  put_le16 (sector + 106,
 		    (get_le16 (sector + 106) & ~2U) | (dirty ? 2 : 0));
@@ -156,11 +189,18 @@ exfat_volume_mark (bool in_use, bool leaking)
 error_t
 exfat_disk_write (off_t offset, const void *buf, size_t len)
 {
-  error_t err = exfat_volume_mark (true, false);
+  error_t err;
 
+  if (volume_failed)
+    return EIO;
+  err = exfat_volume_mark (true, false);
   if (err)
     return err;
-  return raw_write (offset, buf, len);
+  err = raw_write (offset, buf, len);
+  if (err)
+    /* Whatever this was a part of is now partly on the volume.  */
+    exfat_volume_damaged ();
+  return err;
 }
 
 error_t
@@ -428,7 +468,7 @@ read_boot_region (void)
   vol.active_fat = active_fat;
   vol.fat_count = fats;
   vol.serial_number = get_le32 (boot + 100);
-  volume_dirty_at_mount = get_le16 (boot + 106) & 2;
+  volume_stays_dirty = get_le16 (boot + 106) & 2;
 
   free (boot);
 }
@@ -595,7 +635,7 @@ exfat_mount (void)
 	     diskfs_disk_name);
       diskfs_readonly = diskfs_hard_readonly = 1;
     }
-  if (volume_dirty_at_mount && !exfat_allow_dirty && !diskfs_hard_readonly)
+  if (volume_stays_dirty && !exfat_allow_dirty && !diskfs_hard_readonly)
     {
       /* Two entry sets may share clusters after a rename that was cut
 	 short, and freeing those of one would hand the other's to the

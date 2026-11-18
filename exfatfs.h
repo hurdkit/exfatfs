@@ -199,6 +199,18 @@ struct exfat_set
   struct timespec access_time;
 };
 
+/* A change to the entries of one set, or to entries that are to hold
+   one: where they are on the volume, what they hold and what they are
+   to hold.  All that can fail in finding that out does so before the
+   first of the changes that go together is written.  */
+struct exfat_set_change
+{
+  unsigned count;
+  off_t at[EXFAT_SET_MAX];
+  uint8_t before[EXFAT_SET_MAX * EXFAT_ENTRY_SIZE];
+  uint8_t after[EXFAT_SET_MAX * EXFAT_ENTRY_SIZE];
+};
+
 /* What the entry set of a file says about it, apart from its name.  */
 struct exfat_meta
 {
@@ -312,6 +324,8 @@ extern pthread_rwlock_t exfat_entry_lock;
 /* volume.c */
 void exfat_mount (void);
 void exfat_volume_allow_dirty (void);
+void exfat_volume_damaged (void);
+void exfat_volume_failed (void);
 error_t exfat_disk_read (off_t offset, void *buf, size_t len);
 error_t exfat_disk_write (off_t offset, const void *buf, size_t len);
 error_t exfat_disk_zero (off_t offset, off_t len);
@@ -362,8 +376,18 @@ error_t exfat_set_read_at (off_t offset, bool contiguous,
 error_t exfat_dir_find_free (struct exfat_dir *dir, unsigned count,
 			     off_t *pos);
 error_t exfat_set_write_at (off_t offset, bool contiguous,
-			    const struct exfat_set *set, bool creating);
-bool exfat_set_in_one_piece (off_t offset, bool contiguous, unsigned count);
+			    const struct exfat_set *set);
+error_t exfat_set_change_at (struct exfat_set_change *change, off_t offset,
+			     bool contiguous, unsigned count);
+void exfat_set_change_follow (struct exfat_set_change *change,
+			      const struct exfat_set_change *previous,
+			      unsigned count);
+void exfat_set_change_put (struct exfat_set_change *change,
+			   const struct exfat_set *set);
+bool exfat_set_change_in_one_piece (const struct exfat_set_change *change);
+bool exfat_set_change_into_unused (const struct exfat_set_change *change);
+error_t exfat_set_changes_apply (struct exfat_set_change *const *changes,
+				 unsigned count);
 error_t exfat_set_delete_at (off_t offset, bool contiguous);
 void exfat_set_create (struct exfat_set *set,
 		       const struct exfat_name_key *name,

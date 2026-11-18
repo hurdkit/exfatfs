@@ -383,51 +383,187 @@ place_set (struct node *dp, const struct exfat_set *set,
   return 0;
 }
 
-/* Write SET, the entry set of NP, into unused entries of DP, and
-   mark the set at OLD unused if NP had one there.  The new set is
-   whole before the old one goes: if the translator dies between the
-   two, the file is left under both names, sharing its clusters, and
-   not under neither.  */
-static error_t
-enter_set (struct node *dp, struct node *np, const struct exfat_set *set,
-	   const struct exfat_location *old)
+/* What it takes to enter a file in a directory: its entry set, and
+   the changes to the entries of the set that had the name, of those
+   that get the set, and of those that had it.  */
+struct entering
 {
-  struct exfat_location new;
-  error_t err = place_set (dp, set, &new);
+  struct exfat_set set;
+  struct exfat_set_change target, new, old;
+};
 
-  if (err)
-    return err;
-  pthread_rwlock_wrlock (&exfat_entry_lock);
-  err = exfat_set_write_at (new.set_offset, new.parent_contiguous, set, true);
-  if (!err && old->set_offset)
+/* Give NP, which is locked, an entry set in DP, or give the entry set
+   it has a new name and place there: the first half of a rename, which
+   here is all of it.  The name is KEY.  If TARGET_OFFSET is not zero,
+   it is instead the name of the set there, which the file numbered
+   REPLACED loses to NP.
+
+   Everything that can fail for want of memory, of unused entries, or
+   of clusters for DP to grow by, fails before any of the sets is
+   written, and leaves the volume and the records here as they were.
+   After that only the store can fail; exfat_set_changes_apply then
+   takes back what it can and has the volume stay marked as dirty, and
+   the records here are left as they were.
+
+   What is written, in this order, and so what a death of the
+   translator can leave:
+
+   - If the new name takes as many entries as the old one, in the same
+     directory, and one request writes them: the set, where it is.
+   - If NP's set fits in the entries of the one that has the name, and
+     one request writes them: NP's set over that one, so that the name
+     is never without a file, and then NP's old set as unused.  In
+     between, NP is under both names, sharing its clusters.
+   - Otherwise: the set that has the name, if there is one, as unused;
+     NP's set, whole, into unused entries; NP's old set as unused.
+
+   A set that a cluster boundary splits is not written over where it
+   is, because a death between the two requests would leave a set with
+   a wrong checksum.  */
+static error_t
+enter_set (struct node *dp, struct node *np, const struct exfat_name_key *key,
+	   off_t target_offset, ino_t replaced)
+{
+  error_t err = 0;
+  bool contiguous = dp->dn->stream.contiguous;
+  struct exfat_location old;
+  struct exfat_location new = { target_offset, dp->cache_id, contiguous };
+  struct exfat_name_key target_key, old_key;
+  struct entering *w;
+  struct exfat_set_change *steps[3];
+  unsigned nsteps = 0;
+  bool renaming, moving = true;
+
+  if (!exfat_inode_location (np->cache_id, &old))
+    return ESTALE;
+  renaming = old.set_offset != 0;
+  if (target_offset && !renaming)
+    return ESTALE;
+
+  w = malloc (sizeof *w);
+  if (!w)
+    return ENOMEM;
+
+  /* NP is locked, and so is the file that has the name, so their sets
+     stay as they are read here.  */
+  pthread_rwlock_rdlock (&exfat_entry_lock);
+  if (target_offset)
     {
-      err = exfat_set_delete_at (old->set_offset, old->parent_contiguous);
-      if (err)
-	/* Better the old name than both.  */
-	exfat_set_delete_at (new.set_offset, new.parent_contiguous);
+      err = exfat_set_read_at (target_offset, contiguous, &w->set);
+      if (!err)
+	{
+	  exfat_name_key_of_set (&w->set, &target_key);
+	  key = &target_key;
+	  err = exfat_set_change_at (&w->target, target_offset, contiguous,
+				     w->set.count);
+	}
     }
-  if (!err)
-    exfat_inode_move (np->cache_id, &new);
+  if (!err && renaming)
+    {
+      err = exfat_set_read_at (old.set_offset, old.parent_contiguous,
+			       &w->set);
+      if (!err)
+	{
+	  exfat_name_key_of_set (&w->set, &old_key);
+	  err = exfat_set_change_at (&w->old, old.set_offset,
+				     old.parent_contiguous, w->set.count);
+	}
+      if (!err)
+	err = exfat_set_rename (&w->set, key);
+    }
   pthread_rwlock_unlock (&exfat_entry_lock);
+  if (!err && !renaming)
+    {
+      struct exfat_meta meta;
+
+      exfat_node_meta (np, &meta);
+      exfat_set_create (&w->set, key, &meta);
+    }
+
+  if (!err && target_offset && w->set.count <= w->target.count)
+    {
+      steps[nsteps++] = &w->target;
+      if (exfat_set_change_in_one_piece (&w->target))
+	exfat_set_change_put (&w->target, &w->set);
+      else
+	{
+	  exfat_set_change_put (&w->target, NULL);
+	  exfat_set_change_follow (&w->new, &w->target, w->set.count);
+	  exfat_set_change_put (&w->new, &w->set);
+	  steps[nsteps++] = &w->new;
+	}
+    }
+  else if (!err && !target_offset && renaming && old.parent == dp->cache_id
+	   && w->set.count == w->old.count
+	   && exfat_set_change_in_one_piece (&w->old))
+    {
+      exfat_set_change_put (&w->old, &w->set);
+      steps[nsteps++] = &w->old;
+      moving = false;
+    }
+  else if (!err)
+    {
+      /* DP is locked, so what place_set finds unused stays so.  */
+      err = place_set (dp, &w->set, &new);
+      if (!err)
+	{
+	  pthread_rwlock_rdlock (&exfat_entry_lock);
+	  err = exfat_set_change_at (&w->new, new.set_offset,
+				     new.parent_contiguous, w->set.count);
+	  pthread_rwlock_unlock (&exfat_entry_lock);
+	}
+      if (!err && !exfat_set_change_into_unused (&w->new))
+	err = EIO;
+      if (!err)
+	{
+	  if (target_offset)
+	    {
+	      exfat_set_change_put (&w->target, NULL);
+	      steps[nsteps++] = &w->target;
+	    }
+	  exfat_set_change_put (&w->new, &w->set);
+	  steps[nsteps++] = &w->new;
+	}
+    }
+  if (!err && renaming && moving)
+    {
+      exfat_set_change_put (&w->old, NULL);
+      steps[nsteps++] = &w->old;
+    }
+
+  if (!err && renaming)
+    err = renamed_add (old.parent, &old_key, np);
+  if (!err)
+    {
+      pthread_rwlock_wrlock (&exfat_entry_lock);
+      err = exfat_set_changes_apply (steps, nsteps);
+      if (!err)
+	{
+	  if (target_offset)
+	    exfat_inode_detach (replaced);
+	  if (moving)
+	    exfat_inode_move (np->cache_id, &new);
+	}
+      pthread_rwlock_unlock (&exfat_entry_lock);
+      if (err && renaming)
+	exfat_rename_forget (np->cache_id);
+    }
+  free (w);
+
+  if (!err)
+    directory_changed (dp);
   return err;
 }
 
 /* Implement the diskfs_direnter_hard callback as described in
    <hurd/diskfs.h>.  NP gets its entry set here if it has none.  If it
-   has one, this is the first half of a rename.  The set gets the new
-   name where it is if one write can do that: if it stays in its
-   directory, takes as many entries as before, and is not split by a
-   cluster boundary.  Otherwise it is written anew.  */
+   has one, this is the first half of a rename.  */
 error_t
 diskfs_direnter_hard (struct node *dp, const char *name, struct node *np,
 		      struct dirstat *ds, struct protid *cred)
 {
-  error_t err;
   ino_t other = ds->ino;
-  struct exfat_name_key key, old_key;
-  struct exfat_location old;
-  struct exfat_set *set;
-  unsigned old_count = 0;
+  struct exfat_name_key key;
 
   ds->kind = DS_NONE;
   if (!exfat_name_key (name, &key) || !exfat_name_creatable (&key))
@@ -437,57 +573,7 @@ diskfs_direnter_hard (struct node *dp, const char *name, struct node *np,
        have had to be told so to replace it, and was not, for the sake
        of the file that changes the case of its own name.  */
     return EEXIST;
-  if (!exfat_inode_location (np->cache_id, &old))
-    return ESTALE;
-
-  set = malloc (sizeof *set);
-  if (!set)
-    return ENOMEM;
-  if (old.set_offset)
-    {
-      pthread_rwlock_rdlock (&exfat_entry_lock);
-      err = exfat_set_read_at (old.set_offset, old.parent_contiguous, set);
-      pthread_rwlock_unlock (&exfat_entry_lock);
-      if (!err)
-	{
-	  old_count = set->count;
-	  exfat_name_key_of_set (set, &old_key);
-	  err = exfat_set_rename (set, &key);
-	}
-      if (!err)
-	err = renamed_add (old.parent, &old_key, np);
-    }
-  else
-    {
-      struct exfat_meta meta;
-
-      exfat_node_meta (np, &meta);
-      exfat_set_create (set, &key, &meta);
-      err = 0;
-    }
-
-  if (!err && old.set_offset && old.parent == dp->cache_id
-      && set->count == old_count
-      && exfat_set_in_one_piece (old.set_offset, old.parent_contiguous,
-				 old_count))
-    {
-      pthread_rwlock_wrlock (&exfat_entry_lock);
-      err = exfat_set_write_at (old.set_offset, old.parent_contiguous, set,
-				false);
-      pthread_rwlock_unlock (&exfat_entry_lock);
-    }
-  else if (!err)
-    err = enter_set (dp, np, set, &old);
-  free (set);
-
-  if (err)
-    {
-      if (old.set_offset)
-	exfat_rename_forget (np->cache_id);
-      return err;
-    }
-  directory_changed (dp);
-  return 0;
+  return enter_set (dp, np, &key, 0, 0);
 }
 
 /* Implement the diskfs_dirremove_hard callback as described in
@@ -532,21 +618,12 @@ diskfs_dirremove_hard (struct node *dp, struct dirstat *ds)
 
 /* Implement the diskfs_dirrewrite_hard callback as described in
    <hurd/diskfs.h>: the name DS found is to be NP's from now on, and
-   this is the first half of a rename, as in diskfs_direnter_hard.
-   If one write can do it, the set of the file that had the name is
-   overwritten with NP's, so the name is never without a file.
-   Otherwise that set goes first and NP's is written anew.  */
+   this is the first half of a rename, as in diskfs_direnter_hard.  */
 error_t
 diskfs_dirrewrite_hard (struct node *dp, struct node *np, struct dirstat *ds)
 {
-  error_t err;
-  struct exfat_name_key key, old_key;
-  struct exfat_location old;
-  struct exfat_location new
-    = { ds->set_offset, dp->cache_id, dp->dn->stream.contiguous };
-  struct exfat_set *set;
+  off_t target_offset = ds->set_offset;
   ino_t replaced = ds->ino;
-  unsigned target_count = 0;
 
   if (ds->kind == DS_DOTDOT)
     {
@@ -557,58 +634,7 @@ diskfs_dirrewrite_hard (struct node *dp, struct node *np, struct dirstat *ds)
   if (ds->kind != DS_SET)
     return EINVAL;
   ds->kind = DS_NONE;
-  if (!exfat_inode_location (np->cache_id, &old) || !old.set_offset)
-    return ESTALE;
-
-  set = malloc (sizeof *set);
-  if (!set)
-    return ENOMEM;
-  pthread_rwlock_wrlock (&exfat_entry_lock);
-  err = exfat_set_read_at (new.set_offset, new.parent_contiguous, set);
-  if (!err)
-    {
-      target_count = set->count;
-      exfat_name_key_of_set (set, &key);
-      err = exfat_set_read_at (old.set_offset, old.parent_contiguous, set);
-    }
-  if (!err)
-    {
-      exfat_name_key_of_set (set, &old_key);
-      err = exfat_set_rename (set, &key);
-    }
-  if (!err)
-    err = renamed_add (old.parent, &old_key, np);
-  if (!err && set->count == target_count
-      && exfat_set_in_one_piece (new.set_offset, new.parent_contiguous,
-				 target_count))
-    {
-      err = exfat_set_write_at (new.set_offset, new.parent_contiguous, set,
-				false);
-      if (!err)
-	{
-	  exfat_inode_detach (replaced);
-	  exfat_inode_move (np->cache_id, &new);
-	  err = exfat_set_delete_at (old.set_offset, old.parent_contiguous);
-	}
-      pthread_rwlock_unlock (&exfat_entry_lock);
-    }
-  else
-    {
-      if (!err)
-	err = exfat_set_delete_at (new.set_offset, new.parent_contiguous);
-      if (!err)
-	exfat_inode_detach (replaced);
-      pthread_rwlock_unlock (&exfat_entry_lock);
-      if (!err)
-	err = enter_set (dp, np, set, &old);
-    }
-  free (set);
-
-  if (err)
-    exfat_rename_forget (np->cache_id);
-  else
-    directory_changed (dp);
-  return err;
+  return enter_set (dp, np, NULL, target_offset, replaced);
 }
 
 /* Read the next entry set of DIR that can be opened.  */

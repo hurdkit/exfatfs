@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <assert-backtrace.h>
 #include "exfatfs.h"
 
 /* Directories are read through a window of this many bytes.  It is a
@@ -479,17 +480,15 @@ entry_positions (off_t offset, bool contiguous, unsigned count, off_t *at)
    Entries that follow one another on the disk go in one request, and
    a piece that already holds what is to be written is not written.
    With LAST_FIRST, the pieces are written from the last to the
-   first.  */
+   first.  Only the store can make this fail.  */
 static error_t
 transfer_entries (const off_t *at, uint8_t *raw, unsigned count, bool write,
 		  bool last_first)
 {
   error_t err = 0;
-  uint8_t *buf = malloc (count * EXFAT_ENTRY_SIZE + 2 * SECTOR_SIZE);
+  uint8_t buf[EXFAT_SET_MAX * EXFAT_ENTRY_SIZE + 2 * 4096];
   unsigned done = 0;
 
-  if (!buf)
-    return ENOMEM;
   while (!err && done < count)
     {
       unsigned first, last;
@@ -530,7 +529,6 @@ transfer_entries (const off_t *at, uint8_t *raw, unsigned count, bool write,
 	}
       done += last - first + 1;
     }
-  free (buf);
   return err;
 }
 
@@ -538,40 +536,138 @@ transfer_entries (const off_t *at, uint8_t *raw, unsigned count, bool write,
    from.
 
    A set that lies in one run of sectors is written with one request.
-   One that a cluster boundary splits takes two.  When CREATING, the
-   entries were unused before, and the piece that holds the File entry
-   is written last: until then the rest are secondary entries that no
-   set claims, which every reader skips.  A set that is being changed
-   has a wrong checksum if the translator dies between the two, when
-   the change is in both pieces; there is nothing to be done about
-   that without a journal.  */
+   One that a cluster boundary splits takes two, and has a wrong
+   checksum if the translator dies between them, when the change is in
+   both pieces; there is nothing to be done about that without a
+   journal.  */
 error_t
 exfat_set_write_at (off_t offset, bool contiguous,
-		    const struct exfat_set *set, bool creating)
+		    const struct exfat_set *set)
 {
   off_t at[EXFAT_SET_MAX];
   error_t err = entry_positions (offset, contiguous, set->count, at);
 
   if (err)
     return err;
-  return transfer_entries (at, (uint8_t *) set->raw, set->count, true,
-			   creating);
+  return transfer_entries (at, (uint8_t *) set->raw, set->count, true, false);
 }
 
-/* Return whether one request to the store writes the COUNT entries
-   that start at OFFSET: whether they follow one another on the
-   disk.  */
-bool
-exfat_set_in_one_piece (off_t offset, bool contiguous, unsigned count)
+/* Make CHANGE one to the COUNT entries that start at OFFSET, in a
+   directory that is CONTIGUOUS or not, which so far leaves them as
+   they are.  */
+error_t
+exfat_set_change_at (struct exfat_set_change *change, off_t offset,
+		     bool contiguous, unsigned count)
 {
-  off_t at[EXFAT_SET_MAX];
+  error_t err = entry_positions (offset, contiguous, count, change->at);
 
-  if (entry_positions (offset, contiguous, count, at))
-    return false;
-  for (unsigned i = 1; i < count; i++)
-    if (at[i] != at[i - 1] + EXFAT_ENTRY_SIZE)
+  if (!err)
+    err = transfer_entries (change->at, change->before, count, false, false);
+  if (!err)
+    {
+      change->count = count;
+      memcpy (change->after, change->before, count * EXFAT_ENTRY_SIZE);
+    }
+  return err;
+}
+
+/* Make CHANGE one to the first COUNT of the entries that PREVIOUS
+   changes, to be made after it.  */
+void
+exfat_set_change_follow (struct exfat_set_change *change,
+			 const struct exfat_set_change *previous,
+			 unsigned count)
+{
+  assert_backtrace (count <= previous->count);
+  change->count = count;
+  memcpy (change->at, previous->at, count * sizeof *change->at);
+  memcpy (change->before, previous->after, count * EXFAT_ENTRY_SIZE);
+  memcpy (change->after, previous->after, count * EXFAT_ENTRY_SIZE);
+}
+
+/* Have CHANGE leave its entries holding SET, or holding no set if SET
+   is null.  Entries that SET has no use for are left unused.  */
+void
+exfat_set_change_put (struct exfat_set_change *change,
+		      const struct exfat_set *set)
+{
+  unsigned used = set ? set->count : 0;
+
+  assert_backtrace (used <= change->count);
+  if (set)
+    memcpy (change->after, set->raw, used * EXFAT_ENTRY_SIZE);
+  for (unsigned i = used; i < change->count; i++)
+    change->after[i * EXFAT_ENTRY_SIZE] &= ~EXFAT_TYPE_IN_USE;
+}
+
+/* Return whether one request to the store makes CHANGE: whether its
+   entries follow one another on the disk.  */
+bool
+exfat_set_change_in_one_piece (const struct exfat_set_change *change)
+{
+  for (unsigned i = 1; i < change->count; i++)
+    if (change->at[i] != change->at[i - 1] + EXFAT_ENTRY_SIZE)
       return false;
   return true;
+}
+
+/* Return whether none of the entries of CHANGE is in use before
+   it.  */
+bool
+exfat_set_change_into_unused (const struct exfat_set_change *change)
+{
+  for (unsigned i = 0; i < change->count; i++)
+    if (change->before[i * EXFAT_ENTRY_SIZE] & EXFAT_TYPE_IN_USE)
+      return false;
+  return true;
+}
+
+/* Write what CHANGE leaves in its entries, or with UNDO what they
+   held before it.  The File entry is what makes the others a set, so
+   the piece that holds it is written last if this puts it in use, and
+   first otherwise: where one request does not do, the entries are a
+   whole set or secondary entries that no set claims, and never a set
+   with a part missing.  */
+static error_t
+change_write (const struct exfat_set_change *change, bool undo)
+{
+  const uint8_t *from = undo ? change->after : change->before;
+  const uint8_t *to = undo ? change->before : change->after;
+
+  return transfer_entries (change->at, (uint8_t *) to, change->count, true,
+			   !(from[0] & EXFAT_TYPE_IN_USE));
+}
+
+/* Make the COUNT changes in CHANGES, in that order.  They were all
+   prepared, so only the store can make this fail.  If it does, what
+   was written is taken back and the volume is noted as damaged.  If
+   the store does not allow that either, the entries are left as
+   neither the caller nor a reader of the volume expects them, with a
+   file under two names or a name without its file, and nothing more
+   is written to the volume: freeing the clusters of a file that has
+   two entry sets would give those of the other away.  */
+error_t
+exfat_set_changes_apply (struct exfat_set_change *const *changes,
+			 unsigned count)
+{
+  error_t err = 0;
+  bool undone = true;
+  unsigned done = 0;
+
+  while (!err && done < count)
+    err = change_write (changes[done++], false);
+  if (!err)
+    return 0;
+
+  /* The one that failed may be partly made.  */
+  while (done-- > 0)
+    if (change_write (changes[done], true))
+      undone = false;
+  if (undone)
+    exfat_volume_damaged ();
+  else
+    exfat_volume_failed ();
+  return err;
 }
 
 /* Mark the entries of the set whose File entry is at OFFSET as no

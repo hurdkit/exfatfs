@@ -335,7 +335,7 @@ exfat_node_write_set (struct node *np, off_t data_length)
 	{
 	  exfat_set_update (set, &meta);
 	  err = exfat_set_write_at (where.set_offset, where.parent_contiguous,
-				    set, false);
+				    set);
 	}
     }
   pthread_rwlock_unlock (&exfat_entry_lock);
