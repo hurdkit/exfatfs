@@ -270,42 +270,58 @@ diskfs_set_statfs (struct statfs *st)
 
 /* Writing.  */
 
-/* Write the entry set of NP, which is locked, with the allocation that
-   starts at FIRST_CLUSTER and is CONTIGUOUS or not, and DATA_LENGTH as
-   the size.  A file that has no entry set is left alone.  So is a set
-   that would change in its time of last access alone: reading a file
-   does not write to the volume, and the time is recorded along with
-   the next change that is.  */
-static error_t
-write_set (struct node *np, cluster_t first_cluster, bool contiguous,
-	   off_t data_length)
+/* Set *META to what the entry set of NP, which is locked, is to say
+   with DATA_LENGTH as the size.
+
+   The allocation it records is the clusters of NP that DATA_LENGTH
+   takes.  NP has more than those between diskfs_grow and the write
+   that asked for them, and on the volume they belong to no file until
+   the size says that the file has them: section 7.6.5 has DataLength
+   be the size of the file, and what its allocation holds.  */
+static void
+node_meta (struct node *np, off_t data_length, struct exfat_meta *meta)
 {
-  error_t err = 0;
   struct disknode *dn = np->dn;
-  struct exfat_location where;
-  struct exfat_set *set;
-  struct exfat_meta meta =
+  bool clusters = data_length > 0;
+
+  *meta = (struct exfat_meta)
     {
       .attributes = dn->attributes,
-      .first_cluster = first_cluster,
-      .contiguous = contiguous,
+      .first_cluster = clusters ? dn->stream.first_cluster : 0,
+      .contiguous = clusters && dn->stream.contiguous,
       .data_length = data_length,
       .valid_length = data_length,
+      .create_time = dn->create_time,
       .modify_time = np->dn_stat.st_mtim,
       .access_time = np->dn_stat.st_atim,
     };
+  if (!(dn->attributes & EXFAT_ATTR_DIRECTORY))
+    {
+      if (np->dn_stat.st_size < meta->valid_length)
+	meta->valid_length = np->dn_stat.st_size;
+      pthread_mutex_lock (&dn->valid_lock);
+      if (dn->valid_length < meta->valid_length)
+	meta->valid_length = dn->valid_length;
+      pthread_mutex_unlock (&dn->valid_lock);
+    }
+}
+
+/* Write the entry set of NP, which is locked, with DATA_LENGTH as the
+   size.  A file that has no entry set is left alone.  So is a set
+   that would change in its time of last access alone: reading a file
+   does not write to the volume, and the time is recorded along with
+   the next change that is.  */
+error_t
+exfat_node_write_set (struct node *np, off_t data_length)
+{
+  error_t err = 0;
+  struct exfat_location where;
+  struct exfat_set *set;
+  struct exfat_meta meta;
 
   if (np->cache_id == EXFAT_ROOT_INO)
     return 0;
-  if (!(dn->attributes & EXFAT_ATTR_DIRECTORY))
-    {
-      pthread_mutex_lock (&dn->valid_lock);
-      if (dn->valid_length < meta.valid_length)
-	meta.valid_length = dn->valid_length;
-      pthread_mutex_unlock (&dn->valid_lock);
-      if (np->dn_stat.st_size < meta.valid_length)
-	meta.valid_length = np->dn_stat.st_size;
-    }
+  node_meta (np, data_length, &meta);
 
   set = malloc (sizeof *set);
   if (!set)
@@ -327,25 +343,13 @@ write_set (struct node *np, cluster_t first_cluster, bool contiguous,
   return err;
 }
 
-/* Write the entry set of NP, which is locked, with DATA_LENGTH as the
-   size.  */
-error_t
-exfat_node_write_set (struct node *np, off_t data_length)
-{
-  return write_set (np, np->dn->stream.first_cluster,
-		    np->dn->stream.contiguous, data_length);
-}
-
-/* The size to record for NP on the volume, which says how many
-   clusters there are.  Between diskfs_grow and the write that asked
-   for it, there are more than the size of the file takes.  */
+/* The size to record for NP on the volume: that of a file, and the
+   allocation of a directory.  */
 static off_t
 node_data_length (struct node *np)
 {
-  if (np->dn->attributes & EXFAT_ATTR_DIRECTORY
-      || round_cluster (np->dn_stat.st_size) != np->allocsize)
-    return np->allocsize;
-  return np->dn_stat.st_size;
+  return np->dn->attributes & EXFAT_ATTR_DIRECTORY
+    ? np->allocsize : np->dn_stat.st_size;
 }
 
 /* Set *META to what the entry set of NP, which is locked, is to say,
@@ -353,29 +357,7 @@ node_data_length (struct node *np)
 void
 exfat_node_meta (struct node *np, struct exfat_meta *meta)
 {
-  struct disknode *dn = np->dn;
-  bool directory = dn->attributes & EXFAT_ATTR_DIRECTORY;
-
-  *meta = (struct exfat_meta)
-    {
-      .attributes = dn->attributes,
-      .first_cluster = dn->stream.first_cluster,
-      .contiguous = dn->stream.contiguous,
-      .data_length = node_data_length (np),
-      .create_time = dn->create_time,
-      .modify_time = np->dn_stat.st_mtim,
-      .access_time = np->dn_stat.st_atim,
-    };
-  meta->valid_length = meta->data_length;
-  if (!directory)
-    {
-      if (np->dn_stat.st_size < meta->valid_length)
-	meta->valid_length = np->dn_stat.st_size;
-      pthread_mutex_lock (&dn->valid_lock);
-      if (dn->valid_length < meta->valid_length)
-	meta->valid_length = dn->valid_length;
-      pthread_mutex_unlock (&dn->valid_lock);
-    }
+  node_meta (np, node_data_length (np), meta);
 }
 
 /* Sync the info in NP->dn_stat and any associated format-specific
@@ -410,11 +392,39 @@ diskfs_write_disknode (struct node *np, int wait)
 	   diskfs_disk_name, (unsigned long long) np->cache_id);
 }
 
+/* Free the clusters of NP, which is locked, that its size does not
+   take.  A file is left with those when the write that diskfs_grow
+   was for does not follow, or when freeing them failed before.  No
+   entry set records them, so they would stay allocated for
+   nothing.  */
+static void
+trim_node (struct node *np)
+{
+  off_t used = round_cluster (np->dn_stat.st_size);
+
+  if (diskfs_readonly || (np->dn->attributes & EXFAT_ATTR_DIRECTORY)
+      || used >= np->allocsize
+      /* Whoever has the conch was told that it may write up to the
+	 end of the allocation without asking.  */
+      || np->conch.holder)
+    return;
+  /* A page out there is not part of the file, and must not be there
+     with what it holds when the file grows again.  */
+  if ((off_t) round_page (used) < np->allocsize)
+    discard_node_pages (np, round_page (used),
+			np->allocsize - round_page (used));
+  diskfs_truncate (np, np->dn_stat.st_size);
+}
+
+/* Write the entry set of every node that needs it.  No write to a
+   file is under way while its node is locked here, so this is when
+   clusters that a write asked for and did not use can go.  */
 void
 exfat_write_all_nodes (void)
 {
   error_t write_one (struct node *node)
     {
+      trim_node (node);
       diskfs_node_update (node, 1);
       return 0;
     }
@@ -445,14 +455,18 @@ exfat_orphans_hold_clusters (void)
   return found;
 }
 
-/* Make the allocation of NP, which is locked, hold SIZE bytes, and
-   record that on the volume with SIZE as the size.
+/* Make the allocation of NP, which is locked, hold SIZE bytes.
 
-   The clusters are allocated and chained before the entry set says
-   that the file has them, and ValidDataLength stays where it was.
-   Dying in between leaves clusters allocated that no file has; dying
-   afterwards leaves a file that reads as zeros where nothing was
-   written yet.  */
+   The entry set of a directory says so at once: its size is its
+   allocation.  That of a file does not change here.  It records the
+   clusters that the size of the file takes, and the new ones become
+   the file's when the write that asked for them has moved the size
+   and the set is written with it.  A write that does not get that far
+   leaves the file the size it was.
+
+   Dying before the set is written leaves clusters allocated that no
+   file has; dying afterwards leaves a file that reads as zeros where
+   nothing was written yet.  */
 error_t
 exfat_node_grow (struct node *np, off_t size)
 {
@@ -472,17 +486,17 @@ exfat_node_grow (struct node *np, off_t size)
   /* A directory is searched up to its size, so its new clusters hold
      zeros before they are part of it.  */
   err = exfat_stream_grow (&dn->stream, clusters, directory);
-  if (!err)
+  if (!err && directory)
     {
-      if (directory && !had)
+      if (!had)
 	err = exfat_inode_set_dir_cluster (np->cache_id,
 					   dn->stream.first_cluster);
       if (!err)
-	err = exfat_node_write_set (np, directory ? dn->stream.length : size);
+	err = exfat_node_write_set (np, dn->stream.length);
       if (err)
 	{
 	  exfat_stream_shrink (&dn->stream, had);
-	  if (directory && !had)
+	  if (!had)
 	    exfat_inode_set_dir_cluster (np->cache_id, 0);
 	}
     }
@@ -564,10 +578,7 @@ diskfs_truncate (struct node *node, loff_t length)
       off_t allocated = (off_t) clusters << vol.cluster_shift;
 
       diskfs_set_node_times (node);
-      err = write_set (node, clusters ? dn->stream.first_cluster : 0,
-		       clusters && dn->stream.contiguous,
-		       directory || round_cluster (st->st_size) != allocated
-		       ? allocated : st->st_size);
+      err = exfat_node_write_set (node, directory ? allocated : st->st_size);
       if (!err)
 	err = exfat_stream_shrink (&dn->stream, clusters);
       if (!err)
