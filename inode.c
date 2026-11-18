@@ -422,6 +422,29 @@ exfat_write_all_nodes (void)
   diskfs_node_iterate (write_one);
 }
 
+/* Return whether a file that is in no directory has clusters: one
+   that was removed while it was open.  Nothing on the volume says
+   whose those clusters are, and they are freed when the file is
+   closed.  */
+bool
+exfat_orphans_hold_clusters (void)
+{
+  bool found = false;
+
+  error_t check_one (struct node *node)
+    {
+      struct exfat_location where;
+
+      if (node->allocsize && exfat_inode_location (node->cache_id, &where)
+	  && !where.set_offset)
+	found = true;
+      return 0;
+    }
+
+  diskfs_node_iterate (check_one);
+  return found;
+}
+
 /* Make the allocation of NP, which is locked, hold SIZE bytes, and
    record that on the volume with SIZE as the size.
 

@@ -110,11 +110,12 @@ exfat_store_flush (void)
 /* Record in the main boot sector that the volume is being written, if
    IN_USE, or that everything written to it is in place.  Section
    3.1.13.2: VolumeDirty is set while the volume may be inconsistent.
-   Section 3.1.18: PercentInUse either follows the bitmap or says that
-   it does not.  The boot checksum leaves out both fields, so it stays
-   right.  */
+   It stays set when LEAKING says that what is in place leaves
+   clusters allocated that no file on the volume has.  Section 3.1.18:
+   PercentInUse either follows the bitmap or says that it does not.
+   The boot checksum leaves out both fields, so it stays right.  */
 error_t
-exfat_volume_mark (bool in_use)
+exfat_volume_mark (bool in_use, bool leaking)
 {
   error_t err = 0;
   uint8_t sector[4096];
@@ -129,7 +130,7 @@ exfat_volume_mark (bool in_use)
 	err = exfat_disk_read (0, sector, SECTOR_SIZE);
       if (!err)
 	{
-	  bool dirty = in_use || volume_dirty_at_mount;
+	  bool dirty = in_use || leaking || volume_dirty_at_mount;
 
 	  put_le16 (sector + 106,
 		    (get_le16 (sector + 106) & ~2U) | (dirty ? 2 : 0));
@@ -155,7 +156,7 @@ exfat_volume_mark (bool in_use)
 error_t
 exfat_disk_write (off_t offset, const void *buf, size_t len)
 {
-  error_t err = exfat_volume_mark (true);
+  error_t err = exfat_volume_mark (true, false);
 
   if (err)
     return err;

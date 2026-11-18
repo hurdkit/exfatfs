@@ -316,7 +316,7 @@ error_t exfat_disk_read (off_t offset, void *buf, size_t len);
 error_t exfat_disk_write (off_t offset, const void *buf, size_t len);
 error_t exfat_disk_zero (off_t offset, off_t len);
 error_t exfat_store_flush (void);
-error_t exfat_volume_mark (bool in_use);
+error_t exfat_volume_mark (bool in_use, bool leaking);
 error_t exfat_fat_next (cluster_t cluster, cluster_t *next);
 error_t exfat_fat_set_run (cluster_t first, cluster_t count, cluster_t next);
 void exfat_fat_forget (void);
@@ -403,6 +403,7 @@ error_t exfat_node_grow (struct node *np, off_t size);
 error_t exfat_node_write_set (struct node *np, off_t data_length);
 void exfat_node_meta (struct node *np, struct exfat_meta *meta);
 void exfat_write_all_nodes (void);
+bool exfat_orphans_hold_clusters (void);
 
 /* pager.c */
 void create_file_pagers (void);

@@ -184,7 +184,7 @@ diskfs_set_hypermetadata (int wait, int clean)
 {
   if (diskfs_readonly || !clean)
     return 0;
-  return exfat_volume_mark (false);
+  return exfat_volume_mark (false, exfat_orphans_hold_clusters ());
 }
 
 void
