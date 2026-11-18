@@ -187,6 +187,13 @@ diskfs_node_norefs (struct node *np)
 {
   assert_backtrace (!np->dn->pager);
   exfat_rename_forget (np->cache_id);
+  /* libdiskfs drops only nodes that have no links, and truncates them
+     first.  One that still has clusters is one whose truncate failed:
+     libdiskfs zeroed its allocsize and dropped it all the same.
+     exfat_nodes_leak_clusters does not see it any more, and no entry
+     set records the clusters.  */
+  if (np->dn_stat.st_nlink == 0 && np->dn->stream.length)
+    exfat_volume_damaged ();
   exfat_stream_fini (&np->dn->stream);
   pthread_rwlock_destroy (&np->dn->alloc_lock);
   pthread_mutex_destroy (&np->dn->valid_lock);
