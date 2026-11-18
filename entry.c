@@ -633,9 +633,36 @@ change_write (const struct exfat_set_change *change, bool undo)
 {
   const uint8_t *from = undo ? change->after : change->before;
   const uint8_t *to = undo ? change->before : change->after;
+  bool creating = !(from[0] & EXFAT_TYPE_IN_USE);
+  unsigned last_piece = change->count - 1;
+  bool at_end = false;
 
+  while (last_piece > 0
+	 && change->at[last_piece - 1] + EXFAT_ENTRY_SIZE
+	 == change->at[last_piece])
+    last_piece--;
+  for (unsigned i = 0; i < last_piece; i++)
+    if (from[i * EXFAT_ENTRY_SIZE] == 0)
+      at_end = true;
+
+  if (creating && at_end)
+    {
+      /* Section 6.2.1: only entries of type 00h follow an entry of
+	 that type, and the last piece would follow those in the
+	 pieces before it.  So these first get the entries they are to
+	 hold, marked as unused.  */
+      uint8_t unused[EXFAT_SET_MAX * EXFAT_ENTRY_SIZE];
+      error_t err;
+
+      memcpy (unused, to, last_piece * EXFAT_ENTRY_SIZE);
+      for (unsigned i = 0; i < last_piece; i++)
+	unused[i * EXFAT_ENTRY_SIZE] &= ~EXFAT_TYPE_IN_USE;
+      err = transfer_entries (change->at, unused, last_piece, true, false);
+      if (err)
+	return err;
+    }
   return transfer_entries (change->at, (uint8_t *) to, change->count, true,
-			   !(from[0] & EXFAT_TYPE_IN_USE));
+			   creating);
 }
 
 /* Make the COUNT changes in CHANGES, in that order.  They were all
