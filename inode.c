@@ -477,9 +477,15 @@ exfat_orphans_hold_clusters (void)
    and the set is written with it.  A write that does not get that far
    leaves the file the size it was.
 
-   Dying before the set is written leaves clusters allocated that no
-   file has; dying afterwards leaves a file that reads as zeros where
-   nothing was written yet.  */
+   Dying before the set is written leaves the file as it was, and
+   clusters allocated that no file has.  A file that has a FAT chain
+   already is the exception: exfat_stream_grow joins the new clusters
+   to that chain at once, and until the set is written the chain is
+   longer than DataLength says (section 7.6.7), which fsck.exfat
+   reports and cuts back, with nothing that the file held lost.  No
+   order of the two writes avoids that: the set first would leave a
+   chain shorter than its file.  Dying after the set is written
+   leaves a file that reads as zeros where nothing was written yet.  */
 error_t
 exfat_node_grow (struct node *np, off_t size)
 {
