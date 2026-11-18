@@ -96,6 +96,8 @@ pager_write_page (struct user_pager_info *pager, vm_offset_t page,
   struct disknode *dn = node->dn;
   off_t end;
 
+  if (diskfs_readonly)
+    return EROFS;
   if (dn->attributes & EXFAT_ATTR_DIRECTORY)
     /* Directories are changed an entry set at a time, never through
        a mapping.  */
