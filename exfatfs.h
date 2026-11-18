@@ -132,13 +132,15 @@ struct exfat_extent
 /* The allocation of a file, a directory or a system table.  */
 struct exfat_stream
 {
+  /* LOCK protects everything else here.  The length may be read
+     without it by whoever holds the lock of the node it belongs to.  */
+  pthread_mutex_t lock;
   cluster_t first_cluster;
   bool contiguous;		/* NoFatChain: the FAT does not describe it.  */
   off_t length;			/* DataLength.  */
 
   /* The part of the FAT chain walked so far, as extents covering
      clusters 0 to MAPPED - 1.  Unused when CONTIGUOUS.  */
-  pthread_mutex_t lock;
   struct exfat_extent *extents;
   size_t extent_count;
   size_t extents_allocated;
@@ -245,6 +247,8 @@ bool exfat_allocation_valid (cluster_t first, bool contiguous, uint64_t length);
 error_t exfat_chain_length (cluster_t first, cluster_t *count);
 void exfat_stream_init (struct exfat_stream *stream, cluster_t first,
 			bool contiguous, off_t length);
+void exfat_stream_replace (struct exfat_stream *stream, cluster_t first,
+			   bool contiguous, off_t length);
 void exfat_stream_fini (struct exfat_stream *stream);
 error_t exfat_stream_map (struct exfat_stream *stream, off_t offset,
 			  off_t *disk_offset, off_t *run);

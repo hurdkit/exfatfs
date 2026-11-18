@@ -67,8 +67,8 @@ exfat_chain_length (cluster_t first, cluster_t *count)
   return 0;
 }
 
-/* Describe in STREAM an allocation that exfat_allocation_valid
-   accepted.  */
+/* Describe in STREAM, which nothing uses yet, an allocation that
+   exfat_allocation_valid accepted.  */
 void
 exfat_stream_init (struct exfat_stream *stream, cluster_t first,
 		   bool contiguous, off_t length)
@@ -80,13 +80,29 @@ exfat_stream_init (struct exfat_stream *stream, cluster_t first,
   pthread_mutex_init (&stream->lock, NULL);
 }
 
+/* Make STREAM describe another allocation that exfat_allocation_valid
+   accepted.  Other threads may be mapping STREAM meanwhile.  */
 void
-exfat_stream_fini (struct exfat_stream *stream)
+exfat_stream_replace (struct exfat_stream *stream, cluster_t first,
+		      bool contiguous, off_t length)
 {
+  pthread_mutex_lock (&stream->lock);
   free (stream->extents);
   stream->extents = NULL;
   stream->extent_count = stream->extents_allocated = 0;
   stream->mapped = 0;
+  stream->first_cluster = first;
+  stream->contiguous = contiguous;
+  stream->length = length;
+  pthread_mutex_unlock (&stream->lock);
+}
+
+/* Release STREAM, which nothing uses any more.  */
+void
+exfat_stream_fini (struct exfat_stream *stream)
+{
+  free (stream->extents);
+  pthread_mutex_destroy (&stream->lock);
 }
 
 /* Walk STREAM's FAT chain until it covers cluster INDEX.  STREAM is
@@ -148,27 +164,26 @@ exfat_stream_map (struct exfat_stream *stream, off_t offset,
   error_t err = 0;
   cluster_t index = offset >> vol.cluster_shift;
   off_t within = offset & (CLUSTER_SIZE - 1);
-  cluster_t clusters = round_cluster (stream->length) >> vol.cluster_shift;
+  cluster_t clusters;
   cluster_t start = 0, count = 0;
 
+  pthread_mutex_lock (&stream->lock);
+  clusters = round_cluster (stream->length) >> vol.cluster_shift;
   if (offset < 0 || index >= clusters)
-    return EIO;
-
-  if (stream->contiguous)
+    err = EIO;
+  else if (stream->contiguous)
     {
       start = stream->first_cluster + index;
       count = clusters - index;
     }
   else
     {
-      size_t low = 0, high;
-
-      pthread_mutex_lock (&stream->lock);
       err = extend_chain (stream, index);
       if (!err)
 	{
 	  /* Find the last extent that starts at or before INDEX.  */
-	  high = stream->extent_count;
+	  size_t low = 0, high = stream->extent_count;
+
 	  while (high - low > 1)
 	    {
 	      size_t mid = low + (high - low) / 2;
@@ -183,10 +198,10 @@ exfat_stream_map (struct exfat_stream *stream, off_t offset,
 	  count = stream->extents[low].count
 	    - (index - stream->extents[low].index);
 	}
-      pthread_mutex_unlock (&stream->lock);
-      if (err)
-	return err;
     }
+  pthread_mutex_unlock (&stream->lock);
+  if (err)
+    return err;
 
   *disk_offset = cluster_offset (start) + within;
   *run = ((off_t) count << vol.cluster_shift) - within;

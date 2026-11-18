@@ -133,8 +133,8 @@ diskfs_user_read_node (struct node *np, struct lookup_context *ctx)
       err = exfat_chain_length (vol.root_cluster, &clusters);
       if (err)
 	return err;
-      exfat_stream_init (&dn->stream, vol.root_cluster, false,
-			 (off_t) clusters << vol.cluster_shift);
+      exfat_stream_replace (&dn->stream, vol.root_cluster, false,
+			    (off_t) clusters << vol.cluster_shift);
       dn->valid_length = dn->stream.length;
       dn->attributes = EXFAT_ATTR_DIRECTORY;
       dn->parent = EXFAT_ROOT_INO;
@@ -160,8 +160,8 @@ diskfs_user_read_node (struct node *np, struct lookup_context *ctx)
       dn->parent = link.parent;
       dn->parent_contiguous = link.parent_contiguous;
       dn->set_offset = set->offset;
-      exfat_stream_init (&dn->stream, set->first_cluster, set->contiguous,
-			 set->data_length);
+      exfat_stream_replace (&dn->stream, set->first_cluster,
+			    set->contiguous, set->data_length);
       dn->valid_length = set->valid_length;
       dn->attributes = set->attributes;
       dn->create_time = set->create_time;
@@ -244,9 +244,12 @@ diskfs_new_hardrefs (struct node *np)
 error_t
 diskfs_node_reload (struct node *node)
 {
+  error_t err = diskfs_user_read_node (node, NULL);
+
+  /* Pages are being read in meanwhile, and one read before the node
+     changed must not outlive it.  */
   flush_node_pager (node);
-  exfat_stream_fini (&node->dn->stream);
-  return diskfs_user_read_node (node, NULL);
+  return err;
 }
 
 void
