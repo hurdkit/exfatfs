@@ -357,6 +357,7 @@ place_set (struct node *dp, const struct exfat_set *set,
   error_t err;
   struct exfat_dir dir;
   off_t pos, run;
+  bool hidden = false;
 
   for (;;)
     {
@@ -364,9 +365,17 @@ place_set (struct node *dp, const struct exfat_set *set,
       if (err)
 	return err;
       pthread_rwlock_rdlock (&exfat_entry_lock);
-      err = exfat_dir_find_free (&dir, set->count, &pos);
+      err = exfat_dir_find_free (&dir, set->count, &pos, &hidden);
       pthread_rwlock_unlock (&exfat_entry_lock);
       exfat_dir_close (&dir);
+      if (hidden)
+	{
+	  dp->dn->entries_hidden = true;
+	  error (0, 0, "%s: directory inode %llu holds entries in use after"
+		 " its end, which a new entry would bring back; nothing more"
+		 " is written to it, and fsck.exfat should check the volume",
+		 diskfs_disk_name, (unsigned long long) dp->cache_id);
+	}
       if (err != ENOSPC)
 	break;
       if (dp->allocsize + CLUSTER_SIZE > EXFAT_DIR_SIZE_MAX)
@@ -435,6 +444,8 @@ enter_set (struct node *dp, struct node *np, const struct exfat_name_key *key,
   unsigned nsteps = 0;
   bool renaming, moving = true;
 
+  if (dp->dn->entries_hidden)
+    return EIO;
   if (!exfat_inode_location (np->cache_id, &old))
     return ESTALE;
   renaming = old.set_offset != 0;
@@ -607,6 +618,11 @@ diskfs_dirremove_hard (struct node *dp, struct dirstat *ds)
       break;
 
     case DS_SET:
+      if (dp->dn->entries_hidden)
+	{
+	  err = EIO;
+	  break;
+	}
       raw = malloc (EXFAT_SET_MAX * EXFAT_ENTRY_SIZE);
       if (!raw)
 	{

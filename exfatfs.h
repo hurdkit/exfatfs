@@ -296,6 +296,11 @@ struct disknode
   off_t readdir_pos;
   int readdir_hidden;
 
+  /* Set once the directory is found to hold entries that are past its
+     end, as section 6.2.1 puts it, and not of type 00h.  Its entries
+     are not changed from then on.  */
+  bool entries_hidden;
+
   /* Every disknode is on one list, so that what the nodes hold can be
      looked through without their locks.  */
   struct disknode *next_node, **prev_node;
@@ -392,7 +397,7 @@ error_t exfat_dir_next_set (struct exfat_dir *dir, struct exfat_set *set,
 error_t exfat_set_read_at (off_t offset, bool contiguous,
 			   struct exfat_set *set);
 error_t exfat_dir_find_free (struct exfat_dir *dir, unsigned count,
-			     off_t *pos);
+			     off_t *pos, bool *hidden);
 error_t exfat_set_write_at (off_t offset, bool contiguous,
 			    const struct exfat_set *set);
 error_t exfat_set_change_at (struct exfat_set_change *change, off_t offset,

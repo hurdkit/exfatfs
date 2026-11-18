@@ -1100,9 +1100,12 @@ exfat_dir_free_benign (struct exfat_dir *dir)
 
 /* Find COUNT unused entries that follow one another in DIR, and set
    *POS to the offset in the directory of the first.  Return ENOSPC if
-   the directory has to grow to hold them.  */
+   the directory has to grow to hold them.  Return EIO, and set
+   *HIDDEN, if they would be in the entries of type 00h at the end of
+   DIR but an entry after those is in use.  */
 error_t
-exfat_dir_find_free (struct exfat_dir *dir, unsigned count, off_t *pos)
+exfat_dir_find_free (struct exfat_dir *dir, unsigned count, off_t *pos,
+		     bool *hidden)
 {
   unsigned run = 0;
 
@@ -1116,9 +1119,23 @@ exfat_dir_find_free (struct exfat_dir *dir, unsigned count, off_t *pos)
 	return err;
       if (e[0] == 0)
 	{
-	  /* Section 6.2.1: every entry from here on is unused as well.  */
+	  /* Section 6.2.1: every entry from here on is unused as well.  A
+	     set written here moves that end past its last entry, and
+	     what follows would be in the directory again.  */
 	  off_t start = at - run * EXFAT_ENTRY_SIZE;
 
+	  for (off_t rest = at; rest + EXFAT_ENTRY_SIZE <= dir->stream->length;
+	       rest += EXFAT_ENTRY_SIZE)
+	    {
+	      err = dir_entry (dir, rest, &e);
+	      if (err)
+		return err;
+	      if (e[0] != 0)
+		{
+		  *hidden = true;
+		  return EIO;
+		}
+	    }
 	  if ((dir->stream->length - start) / EXFAT_ENTRY_SIZE < count)
 	    return ENOSPC;
 	  *pos = start;
