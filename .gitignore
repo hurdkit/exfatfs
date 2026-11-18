@@ -1,0 +1,4 @@
+*.o
+fs_S.h
+/exfatfs
+/exfatfs.static

@@ -25,7 +25,6 @@
 #include <argp.h>
 #include <argz.h>
 
-#include <version.h>
 #include "exfatfs.h"
 
 struct node *diskfs_root_node;
@@ -35,7 +34,7 @@ struct store_parsed *store_parsed = 0;
 char *diskfs_disk_name = 0;
 
 char *diskfs_server_name = "exfatfs";
-char *diskfs_server_version = HURD_VERSION;
+char *diskfs_server_version = "0.9";
 char *diskfs_extra_version = "GNU Hurd";
 int diskfs_synchronous = 0;
 

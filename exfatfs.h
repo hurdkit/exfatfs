@@ -32,6 +32,9 @@
 
 typedef uint32_t cluster_t;
 
+/* The type mig-mutate.h has the fs.defs stubs take a file port as.  */
+typedef struct protid *protid_t;
+
 #define EXFAT_FIRST_CLUSTER	2
 #define EXFAT_EOC		0xffffffffU
 #define EXFAT_MAX_CLUSTERS	0xfffffff5U

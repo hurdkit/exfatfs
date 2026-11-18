@@ -24,7 +24,7 @@
 #include <time.h>
 #include <error.h>
 #include "exfatfs.h"
-#include "libdiskfs/fs_S.h"
+#include "fs_S.h"
 
 pthread_rwlock_t exfat_entry_lock = PTHREAD_RWLOCK_INITIALIZER;
 
