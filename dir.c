@@ -45,6 +45,27 @@ diskfs_drop_dirstat (struct node *dp, struct dirstat *ds)
   return 0;
 }
 
+/* Set *INUM to the inode number of the file that SET, read from the
+   directory DP, describes.  Return EIO if the volume's directories
+   are linked so that looking the file up could deadlock.  */
+static error_t
+set_inode (struct node *dp, const struct exfat_set *set, ino_t *inum)
+{
+  error_t err;
+  struct exfat_location where
+    = { set->offset, dp->cache_id, dp->dn->stream.contiguous };
+  bool dir = (set->attributes & EXFAT_ATTR_DIRECTORY) && set->data_length;
+
+  err = exfat_inode_get (&where, dir ? set->first_cluster : 0, inum);
+  if (!err && exfat_inode_is_ancestor (*inum, dp->cache_id))
+    /* Only a directory whose clusters hold its own entry set, or that
+       of a directory above it, can show one of those.  DP's lock is
+       held, and a lookup that holds the lock of one above it may be
+       on its way here.  */
+    err = EIO;
+  return err;
+}
+
 /* Write the name of SET to UTF8 and return its length there, or zero
    if it is too long for a directory listing to carry.  */
 static size_t
@@ -149,13 +170,7 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
     {
       ino_t inum;
 
-      where = (struct exfat_location) { set->offset, dp->cache_id,
-					dn->stream.contiguous };
-      err = exfat_inode_get (&where, &inum);
-      if (!err && inum == dp->cache_id)
-	/* Only a directory whose clusters hold its own entry can list
-	   itself.  */
-	err = EIO;
+      err = set_inode (dp, set, &inum);
       if (!err)
 	err = diskfs_cached_lookup (inum, &np);
       if (!err)
@@ -198,9 +213,10 @@ next_good_set (struct exfat_dir *dir, struct exfat_set *set, bool *found)
 }
 
 /* Read the next entry set of DIR, which is open on the directory DP,
-   that a listing shows.  Write its name to UTF8, the length of that
-   to *NAMLEN and its inode number to *INUM.  Add to *HIDDEN the number
-   of sets passed over because their names are too long.  */
+   that a listing shows: one that a lookup would not refuse with EIO.
+   Write its name to UTF8, the length of that to *NAMLEN and its inode
+   number to *INUM.  Add to *HIDDEN the number of sets passed over
+   because their names are too long.  */
 static error_t
 next_listed_set (struct node *dp, struct exfat_dir *dir,
 		 struct exfat_set *set, bool *found, char *utf8,
@@ -209,7 +225,6 @@ next_listed_set (struct node *dp, struct exfat_dir *dir,
   for (;;)
     {
       error_t err = next_good_set (dir, set, found);
-      struct exfat_location where;
 
       if (err || !*found)
 	return err;
@@ -219,9 +234,9 @@ next_listed_set (struct node *dp, struct exfat_dir *dir,
 	  ++*hidden;
 	  continue;
 	}
-      where = (struct exfat_location) { set->offset, dp->cache_id,
-					dp->dn->stream.contiguous };
-      return exfat_inode_get (&where, inum);
+      err = set_inode (dp, set, inum);
+      if (err != EIO)
+	return err;
     }
 }
 
@@ -242,7 +257,8 @@ report_hidden_names (int hidden)
   if (first)
     error (0, 0, "%s: hiding %d name%s longer than %d bytes in a directory;"
 	   " this is reported once, for the first such directory listed",
-	   diskfs_disk_name, hidden, hidden == 1 ? "" : "s", EXFAT_LISTED_NAME_MAX);
+	   diskfs_disk_name, hidden, hidden == 1 ? "" : "s",
+	   EXFAT_LISTED_NAME_MAX);
 }
 
 int
@@ -272,7 +288,8 @@ diskfs_dirempty (struct node *dp, struct protid *cred)
 
 /* Implement the diskfs_get_directs callback as described in
    <hurd/diskfs.h>.  Entries 0 and 1 are `.' and `..', which the volume
-   does not record; entry N + 2 is the Nth entry set of the directory.  */
+   does not record; entry N + 2 is the Nth entry set that a listing
+   shows.  */
 error_t
 diskfs_get_directs (struct node *dp, int entry, int nentries, char **data,
 		    mach_msg_type_number_t *datacnt, vm_size_t bufsiz,

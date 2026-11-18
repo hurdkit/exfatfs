@@ -276,8 +276,10 @@ bool exfat_name_match (const struct exfat_set *set,
 size_t exfat_name_to_utf8 (const uint16_t *name, unsigned length, char *out);
 
 /* vinode.c */
-error_t exfat_inode_get (const struct exfat_location *where, ino_t *ino);
+error_t exfat_inode_get (const struct exfat_location *where,
+			 cluster_t dir_cluster, ino_t *ino);
 bool exfat_inode_location (ino_t ino, struct exfat_location *where);
+bool exfat_inode_is_ancestor (ino_t ino, ino_t of);
 void exfat_inode_move (ino_t ino, const struct exfat_location *where);
 void exfat_inode_forget (ino_t ino);
 

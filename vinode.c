@@ -40,6 +40,9 @@ struct vinode
   uint64_t set_offset;		/* The key in BY_SET_OFFSET.  */
   ino_t parent;
   bool parent_contiguous;
+  /* For a directory that has clusters, the first of them, which is the
+     key in BY_DIR_CLUSTER; zero otherwise.  */
+  cluster_t dir_cluster;
 };
 
 static hurd_ihash_key_t
@@ -66,6 +69,8 @@ static struct hurd_ihash by_ino
 static struct hurd_ihash by_set_offset
   = HURD_IHASH_INITIALIZER_GKI (HURD_IHASH_NO_LOCP, NULL, NULL,
 				hash_key, compare_key);
+static struct hurd_ihash by_dir_cluster
+  = HURD_IHASH_INITIALIZER (HURD_IHASH_NO_LOCP);
 static uint64_t next_ino = EXFAT_ROOT_INO + 1;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -85,18 +90,68 @@ find_set_offset (off_t set_offset)
   return hurd_ihash_find (&by_set_offset, (hurd_ihash_key_t) &key);
 }
 
+/* Enter VI in the tables.  */
+static error_t
+insert (struct vinode *vi)
+{
+  error_t err = hurd_ihash_add (&by_ino, (hurd_ihash_key_t) &vi->ino, vi);
+
+  if (err)
+    return err;
+  err = hurd_ihash_add (&by_set_offset, (hurd_ihash_key_t) &vi->set_offset,
+			vi);
+  if (!err && vi->dir_cluster)
+    {
+      err = hurd_ihash_add (&by_dir_cluster, vi->dir_cluster, vi);
+      if (err)
+	hurd_ihash_remove (&by_set_offset,
+			   (hurd_ihash_key_t) &vi->set_offset);
+    }
+  if (err)
+    hurd_ihash_remove (&by_ino, (hurd_ihash_key_t) &vi->ino);
+  return err;
+}
+
 /* Set *INO to the inode number of the file whose entry set is at
    WHERE, giving it one if it has none yet.  A file that already has a
-   number keeps the directory recorded for it, whatever WHERE says.  */
+   number keeps the directory recorded for it, whatever WHERE says.
+   DIR_CLUSTER is the first cluster of the file if it is a directory
+   that has clusters, and zero otherwise.  Return EIO for a directory
+   whose clusters another directory has.  */
 error_t
-exfat_inode_get (const struct exfat_location *where, ino_t *ino)
+exfat_inode_get (const struct exfat_location *where, cluster_t dir_cluster,
+		 ino_t *ino)
 {
   error_t err = 0;
-  struct vinode *vi;
+  struct vinode *vi, *owner = NULL;
 
   pthread_mutex_lock (&lock);
   vi = find_set_offset (where->set_offset);
-  if (!vi)
+  if (dir_cluster)
+    owner = hurd_ihash_find (&by_dir_cluster, dir_cluster);
+
+  /* Two directory entries with the same first cluster are one
+     directory under two names, each with a node and a lock of its own.
+     Its entries then have two parents, so one lookup can hold the
+     first while it waits for a node that another lookup, holding the
+     second, found below it: lookups of `b' in `a' and of `a' in `b'
+     deadlock when `b' has the first cluster of the directory that
+     holds `a'.  So the first entry seen with a first cluster keeps
+     it, and any other is refused.  The root always has its own, and
+     every ancestor of a directory was seen before it.
+
+     Chains that start apart and join further on are not noticed:
+     that would take walking the whole chain of every directory
+     against all the others.  The lookup refuses, with
+     exfat_inode_is_ancestor, the one of those that needs no more than
+     two lookups to deadlock.  */
+  if (dir_cluster == vol.root_cluster || (owner && owner != vi))
+    err = EIO;
+  else if (vi && vi->dir_cluster != dir_cluster)
+    /* The entry set there is no longer the one the number was given
+       to.  */
+    err = EIO;
+  else if (!vi)
     {
       vi = malloc (sizeof *vi);
       if (!vi)
@@ -104,15 +159,8 @@ exfat_inode_get (const struct exfat_location *where, ino_t *ino)
       else
 	{
 	  *vi = (struct vinode) { next_ino, where->set_offset, where->parent,
-				  where->parent_contiguous };
-	  err = hurd_ihash_add (&by_ino, (hurd_ihash_key_t) &vi->ino, vi);
-	  if (!err)
-	    {
-	      err = hurd_ihash_add (&by_set_offset,
-				    (hurd_ihash_key_t) &vi->set_offset, vi);
-	      if (err)
-		hurd_ihash_remove (&by_ino, (hurd_ihash_key_t) &vi->ino);
-	    }
+				  where->parent_contiguous, dir_cluster };
+	  err = insert (vi);
 	  if (err)
 	    free (vi);
 	  else
@@ -142,6 +190,20 @@ exfat_inode_location (ino_t ino, struct exfat_location *where)
   return vi != NULL;
 }
 
+/* Return whether the file numbered INO is the directory numbered OF or
+   one of those above it.  */
+bool
+exfat_inode_is_ancestor (ino_t ino, ino_t of)
+{
+  struct vinode *vi;
+
+  pthread_mutex_lock (&lock);
+  while (of != ino && (vi = find_ino (of)))
+    of = vi->parent;
+  pthread_mutex_unlock (&lock);
+  return of == ino;
+}
+
 /* Record that the entry set of the file numbered INO is now at WHERE,
    where no other file's is.  The caller keeps a directory from moving
    into itself or below itself.  */
@@ -161,7 +223,7 @@ exfat_inode_move (ino_t ino, const struct exfat_location *where)
       vi->set_offset = where->set_offset;
       err = hurd_ihash_add (&by_set_offset,
 			    (hurd_ihash_key_t) &vi->set_offset, vi);
-      /* As for libdiskfs's node cache.  */
+      /* libdiskfs's node cache does not survive this either.  */
       assert_perror_backtrace (err);
     }
   vi->parent = where->parent;
@@ -182,6 +244,8 @@ exfat_inode_forget (ino_t ino)
     {
       hurd_ihash_remove (&by_ino, (hurd_ihash_key_t) &vi->ino);
       hurd_ihash_remove (&by_set_offset, (hurd_ihash_key_t) &vi->set_offset);
+      if (vi->dir_cluster)
+	hurd_ihash_remove (&by_dir_cluster, vi->dir_cluster);
       free (vi);
     }
   pthread_mutex_unlock (&lock);
