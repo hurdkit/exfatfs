@@ -237,7 +237,10 @@ struct exfat_name_key
 /* Where the entry set of a file is.  */
 struct exfat_location
 {
-  off_t set_offset;		/* Volume offset of its File entry.  */
+  /* Volume offset of its File entry, or zero for a file that has no
+     entry set: one not entered in a directory yet, or removed from
+     its directory and still open.  */
+  off_t set_offset;
   ino_t parent;			/* The directory that holds it.  */
   /* Whether that directory is contiguous, which is what it takes to
      follow the set from SET_OFFSET across a cluster boundary.  */
@@ -355,9 +358,12 @@ size_t exfat_name_to_utf8 (const uint16_t *name, unsigned length, char *out);
 /* vinode.c */
 error_t exfat_inode_get (const struct exfat_location *where,
 			 cluster_t dir_cluster, ino_t *ino);
+error_t exfat_inode_new (ino_t parent, ino_t *ino);
 bool exfat_inode_location (ino_t ino, struct exfat_location *where);
 bool exfat_inode_is_ancestor (ino_t ino, ino_t of);
 void exfat_inode_move (ino_t ino, const struct exfat_location *where);
+void exfat_inode_detach (ino_t ino);
+error_t exfat_inode_set_dir_cluster (ino_t ino, cluster_t dir_cluster);
 void exfat_inode_forget (ino_t ino);
 
 /* inode.c */

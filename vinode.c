@@ -37,7 +37,9 @@
 struct vinode
 {
   uint64_t ino;			/* The key in BY_INO.  */
-  uint64_t set_offset;		/* The key in BY_SET_OFFSET.  */
+  /* The key in BY_SET_OFFSET, or zero for a file that has no entry
+     set and is not in that table.  */
+  uint64_t set_offset;
   ino_t parent;
   bool parent_contiguous;
   /* For a directory that has clusters, the first of them, which is the
@@ -98,12 +100,13 @@ insert (struct vinode *vi)
 
   if (err)
     return err;
-  err = hurd_ihash_add (&by_set_offset, (hurd_ihash_key_t) &vi->set_offset,
-			vi);
+  if (vi->set_offset)
+    err = hurd_ihash_add (&by_set_offset, (hurd_ihash_key_t) &vi->set_offset,
+			  vi);
   if (!err && vi->dir_cluster)
     {
       err = hurd_ihash_add (&by_dir_cluster, vi->dir_cluster, vi);
-      if (err)
+      if (err && vi->set_offset)
 	hurd_ihash_remove (&by_set_offset,
 			   (hurd_ihash_key_t) &vi->set_offset);
     }
@@ -173,9 +176,33 @@ exfat_inode_get (const struct exfat_location *where, cluster_t dir_cluster,
   return err;
 }
 
-/* Set *WHERE to the place of the entry set of the file numbered INO.
-   Return false if there is none: for the root, and for a file that
-   exfat_inode_forget was told about.  */
+/* Set *INO to a number for a new file in the directory numbered
+   PARENT.  It has no entry set until exfat_inode_move says where one
+   is.  */
+error_t
+exfat_inode_new (ino_t parent, ino_t *ino)
+{
+  error_t err;
+  struct vinode *vi = malloc (sizeof *vi);
+
+  if (!vi)
+    return ENOMEM;
+  pthread_mutex_lock (&lock);
+  *vi = (struct vinode) { next_ino, 0, parent, false, 0 };
+  err = insert (vi);
+  if (err)
+    free (vi);
+  else
+    *ino = next_ino++;
+  pthread_mutex_unlock (&lock);
+  return err;
+}
+
+/* Set *WHERE to the place of the entry set of the file numbered INO,
+   which has none if WHERE->set_offset comes back zero, and to the
+   directory it is or was in.  Return false if nothing is known of
+   INO: for the root, and for a file that exfat_inode_forget was told
+   about.  */
 bool
 exfat_inode_location (ino_t ino, struct exfat_location *where)
 {
@@ -204,22 +231,32 @@ exfat_inode_is_ancestor (ino_t ino, ino_t of)
   return of == ino;
 }
 
-/* Record that the entry set of the file numbered INO is now at WHERE,
-   where no other file's is.  The caller keeps a directory from moving
-   into itself or below itself.  */
+/* Record that the entry set of the file numbered INO is now at WHERE.
+   The caller wrote it there, where no entry was in use, so a file
+   still recorded at that place lost its entry set without this
+   translator doing it, and is recorded as having none.  The caller
+   keeps a directory from moving into itself or below itself.  */
 void
 exfat_inode_move (ino_t ino, const struct exfat_location *where)
 {
   error_t err;
-  struct vinode *vi;
+  struct vinode *vi, *stale;
 
   pthread_mutex_lock (&lock);
   vi = find_ino (ino);
   assert_backtrace (vi);
   if ((off_t) vi->set_offset != where->set_offset)
     {
-      assert_backtrace (!find_set_offset (where->set_offset));
-      hurd_ihash_remove (&by_set_offset, (hurd_ihash_key_t) &vi->set_offset);
+      stale = find_set_offset (where->set_offset);
+      if (stale)
+	{
+	  hurd_ihash_remove (&by_set_offset,
+			     (hurd_ihash_key_t) &stale->set_offset);
+	  stale->set_offset = 0;
+	}
+      if (vi->set_offset)
+	hurd_ihash_remove (&by_set_offset,
+			   (hurd_ihash_key_t) &vi->set_offset);
       vi->set_offset = where->set_offset;
       err = hurd_ihash_add (&by_set_offset,
 			    (hurd_ihash_key_t) &vi->set_offset, vi);
@@ -231,8 +268,56 @@ exfat_inode_move (ino_t ino, const struct exfat_location *where)
   pthread_mutex_unlock (&lock);
 }
 
-/* Forget where the entry set of the file numbered INO was, because it
-   is no longer there.  The number is not given to another file.  */
+/* Record that the file numbered INO no longer has an entry set.  It
+   keeps its number, and the directory it was in, for as long as it
+   stays open.  */
+void
+exfat_inode_detach (ino_t ino)
+{
+  struct vinode *vi;
+
+  pthread_mutex_lock (&lock);
+  vi = find_ino (ino);
+  if (vi && vi->set_offset)
+    {
+      hurd_ihash_remove (&by_set_offset, (hurd_ihash_key_t) &vi->set_offset);
+      vi->set_offset = 0;
+    }
+  pthread_mutex_unlock (&lock);
+}
+
+/* Record that DIR_CLUSTER is now the first cluster of the directory
+   numbered INO, or that it has no clusters if DIR_CLUSTER is zero.
+   Return EIO if another directory has that cluster.  */
+error_t
+exfat_inode_set_dir_cluster (ino_t ino, cluster_t dir_cluster)
+{
+  error_t err = 0;
+  struct vinode *vi;
+
+  pthread_mutex_lock (&lock);
+  vi = find_ino (ino);
+  assert_backtrace (vi);
+  if (vi->dir_cluster != dir_cluster)
+    {
+      if (dir_cluster == vol.root_cluster
+	  || (dir_cluster && hurd_ihash_find (&by_dir_cluster, dir_cluster)))
+	err = EIO;
+      else if (dir_cluster)
+	err = hurd_ihash_add (&by_dir_cluster, dir_cluster, vi);
+      if (!err)
+	{
+	  if (vi->dir_cluster)
+	    hurd_ihash_remove (&by_dir_cluster, vi->dir_cluster);
+	  vi->dir_cluster = dir_cluster;
+	}
+    }
+  pthread_mutex_unlock (&lock);
+  return err;
+}
+
+/* Forget the file numbered INO, which is gone.  The number is not
+   given to another file.  */
 void
 exfat_inode_forget (ino_t ino)
 {
@@ -243,7 +328,9 @@ exfat_inode_forget (ino_t ino)
   if (vi)
     {
       hurd_ihash_remove (&by_ino, (hurd_ihash_key_t) &vi->ino);
-      hurd_ihash_remove (&by_set_offset, (hurd_ihash_key_t) &vi->set_offset);
+      if (vi->set_offset)
+	hurd_ihash_remove (&by_set_offset,
+			   (hurd_ihash_key_t) &vi->set_offset);
       if (vi->dir_cluster)
 	hurd_ihash_remove (&by_dir_cluster, vi->dir_cluster);
       free (vi);
