@@ -159,7 +159,8 @@ exfat_store_flush (void)
    PercentInUse either follows the bitmap or says that it does not.
    Section 3.1.13.4: ClearToZero is cleared before anything is
    modified.  The boot checksum leaves out both fields, so it stays
-   right.  */
+   right.  Once the volume has failed, the boot sector stays as it is:
+   VolumeDirty is set on the disk by then.  */
 error_t
 exfat_volume_mark (bool in_use, bool leaking)
 {
@@ -167,7 +168,9 @@ exfat_volume_mark (bool in_use, bool leaking)
   uint8_t sector[4096];
 
   pthread_mutex_lock (&volume_dirty_lock);
-  if (in_use != volume_in_use)
+  if (volume_failed)
+    err = in_use ? EIO : 0;
+  else if (in_use != volume_in_use)
     {
       if (!in_use)
 	/* What the flag vouches for must be on the medium before it.  */
