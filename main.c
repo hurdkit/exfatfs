@@ -40,7 +40,7 @@ char *diskfs_extra_version = "GNU Hurd";
 int diskfs_synchronous = 0;
 
 int diskfs_link_max = 1;
-int diskfs_name_max = EXFAT_UTF8_NAME_MAX;
+int diskfs_name_max = EXFAT_LISTED_NAME_MAX;
 int diskfs_maxsymlinks = 8;
 
 /* The UID and GID for all files in the filesystem.  */

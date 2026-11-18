@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <error.h>
 #include "exfatfs.h"
 
 /* Nothing is carried from a lookup to a later directory change while
@@ -44,6 +45,16 @@ diskfs_drop_dirstat (struct node *dp, struct dirstat *ds)
   return 0;
 }
 
+/* Write the name of SET to UTF8 and return its length there, or zero
+   if it is too long for a directory listing to carry.  */
+static size_t
+listable_name (const struct exfat_set *set, char *utf8)
+{
+  size_t len = exfat_name_to_utf8 (set->name, set->name_length, utf8);
+
+  return len > EXFAT_LISTED_NAME_MAX ? 0 : len;
+}
+
 /* Implement the diskfs_lookup_hard callback as described in
    <hurd/diskfs.h>.  */
 error_t
@@ -59,6 +70,7 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
   struct exfat_name_key key;
   struct exfat_dir dir;
   struct exfat_set *set;
+  char utf8[EXFAT_UTF8_NAME_MAX + 1];
   bool found = false;
 
   if (npp)
@@ -105,6 +117,8 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
       return err;
     }
 
+  if (strlen (name) > EXFAT_LISTED_NAME_MAX)
+    return ENAMETOOLONG;
   if (!exfat_name_key (name, &key))
     return ENOENT;
 
@@ -124,6 +138,10 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
 
   if (!err && !found)
     err = ENOENT;
+  if (!err && !listable_name (set, utf8))
+    /* A name that fits can still match one that does not, where the
+       two cases of a letter differ in length.  */
+    err = ENAMETOOLONG;
   if (!err)
     err = set->error;
   if (!err && npp)
@@ -166,9 +184,9 @@ diskfs_dirrewrite_hard (struct node *dp, struct node *np, struct dirstat *ds)
   return EROFS;
 }
 
-/* Read the next entry set of DIR that a listing shows.  */
+/* Read the next entry set of DIR that can be opened.  */
 static error_t
-next_listed_set (struct exfat_dir *dir, struct exfat_set *set, bool *found)
+next_good_set (struct exfat_dir *dir, struct exfat_set *set, bool *found)
 {
   error_t err;
 
@@ -176,6 +194,46 @@ next_listed_set (struct exfat_dir *dir, struct exfat_set *set, bool *found)
     err = exfat_dir_next_set (dir, set, found);
   while (!err && *found && set->error);
   return err;
+}
+
+/* Read the next entry set of DIR that a listing shows, and write its
+   name to UTF8 and the length of that to *NAMLEN.  Add to *HIDDEN the
+   number of sets passed over because their names are too long.  */
+static error_t
+next_listed_set (struct exfat_dir *dir, struct exfat_set *set, bool *found,
+		 char *utf8, size_t *namlen, int *hidden)
+{
+  for (;;)
+    {
+      error_t err = next_good_set (dir, set, found);
+
+      if (err || !*found)
+	return err;
+      *namlen = listable_name (set, utf8);
+      if (*namlen)
+	return 0;
+      ++*hidden;
+    }
+}
+
+/* Say that a listing of a directory left out HIDDEN names.  Only the
+   first such directory is reported, so that a volume full of them
+   does not fill the log.  */
+static void
+report_hidden_names (int hidden)
+{
+  static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+  static bool reported;
+  bool first;
+
+  pthread_mutex_lock (&lock);
+  first = !reported;
+  reported = true;
+  pthread_mutex_unlock (&lock);
+  if (first)
+    error (0, 0, "%s: hiding %d name%s longer than %d bytes in a directory;"
+	   " this is reported once, for the first such directory listed",
+	   diskfs_disk_name, hidden, hidden == 1 ? "" : "s", EXFAT_LISTED_NAME_MAX);
 }
 
 int
@@ -191,7 +249,7 @@ diskfs_dirempty (struct node *dp, struct protid *cred)
   err = exfat_dir_open (&dir, &dp->dn->stream, dp == diskfs_root_node);
   if (!err)
     {
-      err = next_listed_set (&dir, set, &found);
+      err = next_good_set (&dir, set, &found);
       exfat_dir_close (&dir);
     }
   free (set);
@@ -219,8 +277,11 @@ diskfs_get_directs (struct node *dp, int entry, int nentries, char **data,
   bool ouralloc = false;
   bool found = true;
   char *datap;
+  char name[EXFAT_UTF8_NAME_MAX + 1];
+  size_t namlen;
   int index = entry;
   int count = 0;
+  int hidden = 0;
 
   set = malloc (sizeof *set);
   if (!set)
@@ -240,9 +301,10 @@ diskfs_get_directs (struct node *dp, int entry, int nentries, char **data,
 	{
 	  at = dn->readdir_index;
 	  dir.pos = dn->readdir_pos;
+	  hidden = dn->readdir_hidden;
 	}
       for (; !err && found && at < entry - 2; at++)
-	err = next_listed_set (&dir, set, &found);
+	err = next_listed_set (&dir, set, &found, name, &namlen, &hidden);
     }
 
   if (!err && found && allocsize > *datacnt)
@@ -263,8 +325,7 @@ diskfs_get_directs (struct node *dp, int entry, int nentries, char **data,
 	 && (nentries == -1 || count < nentries)
 	 && (!bufsiz || (vm_size_t) (datap - *data) < bufsiz))
     {
-      char name[EXFAT_UTF8_NAME_MAX + 1];
-      size_t namlen, reclen;
+      size_t reclen;
       struct dirent *userp;
       ino_t inum;
       unsigned char d_type = DT_DIR;
@@ -283,10 +344,9 @@ diskfs_get_directs (struct node *dp, int entry, int nentries, char **data,
 	}
       else
 	{
-	  err = next_listed_set (&dir, set, &found);
+	  err = next_listed_set (&dir, set, &found, name, &namlen, &hidden);
 	  if (err || !found)
 	    break;
-	  namlen = exfat_name_to_utf8 (set->name, set->name_length, name);
 	  inum = set->offset / EXFAT_ENTRY_SIZE;
 	  if (!(set->attributes & EXFAT_ATTR_DIRECTORY))
 	    d_type = DT_REG;
@@ -328,7 +388,10 @@ diskfs_get_directs (struct node *dp, int entry, int nentries, char **data,
     {
       dn->readdir_index = index - 2;
       dn->readdir_pos = dir.pos;
+      dn->readdir_hidden = hidden;
     }
+  if (!err && !found && hidden)
+    report_hidden_names (hidden);
   exfat_dir_close (&dir);
   free (set);
 

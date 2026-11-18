@@ -40,6 +40,9 @@ typedef uint32_t cluster_t;
 #define EXFAT_SET_MAX		256	/* A primary and 255 secondaries.  */
 #define EXFAT_NAME_MAX		255	/* In UTF-16 code units.  */
 #define EXFAT_UTF8_NAME_MAX	(EXFAT_NAME_MAX * 3)
+/* The longest name a directory listing can carry, in bytes: d_namlen
+   in struct dirent is an unsigned char.  */
+#define EXFAT_LISTED_NAME_MAX	255
 #define EXFAT_DIR_SIZE_MAX	(256 << 20)
 
 #define EXFAT_TYPE_IN_USE	0x80
@@ -209,9 +212,11 @@ struct disknode
 
   /* The directory offset at which entry set number READDIR_INDEX
      starts, so that a listing read in pieces is not rescanned from
-     the start for each piece.  */
+     the start for each piece, and the number of sets before it that
+     the listing leaves out for their long names.  */
   int readdir_index;
   off_t readdir_pos;
+  int readdir_hidden;
 };
 
 struct user_pager_info

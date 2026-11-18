@@ -172,6 +172,7 @@ diskfs_user_read_node (struct node *np, struct lookup_context *ctx)
 
   dn->readdir_index = 0;
   dn->readdir_pos = 0;
+  dn->readdir_hidden = 0;
 
   st->st_fstype = FSTYPE_MSLOSS;
   st->st_fsid = getpid ();
