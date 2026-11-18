@@ -389,6 +389,7 @@ bool exfat_set_change_into_unused (const struct exfat_set_change *change);
 error_t exfat_set_changes_apply (struct exfat_set_change *const *changes,
 				 unsigned count);
 error_t exfat_set_delete_at (off_t offset, bool contiguous);
+void exfat_set_free_unknown (const uint8_t *raw, unsigned count);
 void exfat_set_create (struct exfat_set *set,
 		       const struct exfat_name_key *name,
 		       const struct exfat_meta *meta);

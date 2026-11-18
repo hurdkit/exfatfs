@@ -548,6 +548,10 @@ enter_set (struct node *dp, struct node *np, const struct exfat_name_key *key,
       pthread_rwlock_unlock (&exfat_entry_lock);
       if (err && renaming)
 	exfat_rename_forget (np->cache_id);
+      if (!err && target_offset)
+	/* The set that had the name is gone, and what it held of its
+	   own with it.  */
+	exfat_set_free_unknown (w->target.before, w->target.count);
     }
   free (w);
 
