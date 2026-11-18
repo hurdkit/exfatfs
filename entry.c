@@ -1114,9 +1114,11 @@ exfat_dir_find_free (struct exfat_dir *dir, unsigned count, off_t *pos,
 	return err;
       if (e[0] == 0)
 	{
-	  /* Section 6.2.1: every entry from here on is unused as well.  A
-	     set written here moves that end past its last entry, and
-	     what follows would be in the directory again.  */
+	  /* Section 6.2.1.1: every entry from here on is an end of the
+	     directory as well.  A set written here moves that end past
+	     its last entry, and what follows is in the directory again.
+	     An unused entry there stays unused, but one in use would
+	     come back to life.  */
 	  off_t start = at - run * EXFAT_ENTRY_SIZE;
 
 	  for (off_t rest = at; rest + EXFAT_ENTRY_SIZE <= dir->stream->length;
@@ -1125,7 +1127,7 @@ exfat_dir_find_free (struct exfat_dir *dir, unsigned count, off_t *pos,
 	      err = dir_entry (dir, rest, &e);
 	      if (err)
 		return err;
-	      if (e[0] != 0)
+	      if (e[0] & EXFAT_TYPE_IN_USE)
 		{
 		  *hidden = true;
 		  return EIO;

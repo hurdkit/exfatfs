@@ -288,9 +288,9 @@ struct disknode
   off_t readdir_pos;
   int readdir_hidden;
 
-  /* Set once the directory is found to hold entries that are past its
-     end, as section 6.2.1 puts it, and not of type 00h.  Its entries
-     are not changed from then on.  */
+  /* Set once the directory is found to hold entries in use past its
+     end, as section 6.2.1.1 puts it.  No set is put into it from then
+     on, which would bring them back.  */
   bool entries_hidden;
 };
 

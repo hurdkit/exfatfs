@@ -372,9 +372,9 @@ place_set (struct node *dp, const struct exfat_set *set,
 	{
 	  dp->dn->entries_hidden = true;
 	  error (0, 0, "%s: directory inode %llu holds entries in use after"
-		 " its end, which a new entry would bring back; nothing more"
-		 " is written to it, and fsck.exfat should check the volume",
-		 diskfs_disk_name, (unsigned long long) dp->cache_id);
+		 " its end, which a new entry would bring back; no entry is"
+		 " added to it", diskfs_disk_name,
+		 (unsigned long long) dp->cache_id);
 	}
       if (err != ENOSPC)
 	break;
@@ -618,11 +618,8 @@ diskfs_dirremove_hard (struct node *dp, struct dirstat *ds)
       break;
 
     case DS_SET:
-      if (dp->dn->entries_hidden)
-	{
-	  err = EIO;
-	  break;
-	}
+      /* Even in a directory with entries_hidden: marking a set unused
+	 brings back nothing.  */
       raw = malloc (EXFAT_SET_MAX * EXFAT_ENTRY_SIZE);
       if (!raw)
 	{
