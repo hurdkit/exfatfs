@@ -193,6 +193,18 @@ exfat_stream_map (struct exfat_stream *stream, off_t offset,
   return 0;
 }
 
+/* Walk the whole of STREAM's cluster chain, so that damage to it shows
+   up as an error here and not in a page fault later.  */
+error_t
+exfat_stream_check (struct exfat_stream *stream)
+{
+  off_t disk_offset, run;
+
+  if (stream->length == 0)
+    return 0;
+  return exfat_stream_map (stream, stream->length - 1, &disk_offset, &run);
+}
+
 /* Read LEN bytes at OFFSET of STREAM into BUF.  OFFSET and LEN must be
    multiples of the sector size, and the range must lie inside the
    stream's allocation.  */

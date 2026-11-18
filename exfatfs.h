@@ -243,6 +243,7 @@ void exfat_stream_init (struct exfat_stream *stream, cluster_t first,
 void exfat_stream_fini (struct exfat_stream *stream);
 error_t exfat_stream_map (struct exfat_stream *stream, off_t offset,
 			  off_t *disk_offset, off_t *run);
+error_t exfat_stream_check (struct exfat_stream *stream);
 error_t exfat_stream_read (struct exfat_stream *stream, off_t offset,
 			   void *buf, size_t len);
 

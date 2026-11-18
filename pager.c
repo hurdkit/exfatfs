@@ -176,9 +176,20 @@ diskfs_get_filemap (struct node *node, vm_prot_t prot)
 {
   struct pager *pager;
   mach_port_t right;
+  error_t err;
 
   assert_backtrace (S_ISDIR (node->dn_stat.st_mode)
 		    || S_ISREG (node->dn_stat.st_mode));
+
+  /* A pager can only report a bad chain as a memory error, which the
+     reader takes as a signal.  Find out now, while the caller can still
+     be told EIO.  */
+  err = exfat_stream_check (&node->dn->stream);
+  if (err)
+    {
+      errno = err;
+      return MACH_PORT_NULL;
+    }
 
   pthread_spin_lock (&node_to_page_lock);
   pager = node->dn->pager;
