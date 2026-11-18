@@ -177,32 +177,43 @@ static struct fat_block
 } fat_cache[FAT_CACHE_BLOCKS];
 static pthread_mutex_t fat_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Point *SLOT to the cached block that holds the FAT entry of
+   CLUSTER, reading it first if need be.  The cache is locked.  */
+static error_t
+fat_block (cluster_t cluster, struct fat_block **slot)
+{
+  error_t err;
+  off_t block = cluster / FAT_BLOCK_ENTRIES;
+  off_t start = block * FAT_BLOCK_SIZE;
+  size_t len = FAT_BLOCK_SIZE;
+
+  *slot = &fat_cache[block % FAT_CACHE_BLOCKS];
+  if ((*slot)->tag == block + 1)
+    return 0;
+
+  if (start + (off_t) len > vol.fat_size)
+    len = vol.fat_size - start;
+  (*slot)->tag = 0;
+  err = exfat_disk_read (vol.fat_offset + start, (*slot)->data, len);
+  if (!err)
+    (*slot)->tag = block + 1;
+  return err;
+}
+
 /* Set *NEXT to the FAT entry of CLUSTER: the cluster after it in its
    chain, or EXFAT_EOC.  Any other value is EIO.  */
 error_t
 exfat_fat_next (cluster_t cluster, cluster_t *next)
 {
-  error_t err = 0;
-  off_t block = cluster / FAT_BLOCK_ENTRIES;
-  struct fat_block *slot = &fat_cache[block % FAT_CACHE_BLOCKS];
+  error_t err;
+  struct fat_block *slot;
   cluster_t value = 0;
 
   if (!cluster_valid (cluster))
     return EIO;
 
   pthread_mutex_lock (&fat_cache_lock);
-  if (slot->tag != block + 1)
-    {
-      off_t start = block * FAT_BLOCK_SIZE;
-      size_t len = FAT_BLOCK_SIZE;
-
-      if (start + (off_t) len > vol.fat_size)
-	len = vol.fat_size - start;
-      slot->tag = 0;
-      err = exfat_disk_read (vol.fat_offset + start, slot->data, len);
-      if (!err)
-	slot->tag = block + 1;
-    }
+  err = fat_block (cluster, &slot);
   if (!err)
     value = get_le32 (slot->data
 		      + (cluster % FAT_BLOCK_ENTRIES) * sizeof (uint32_t));
@@ -214,6 +225,63 @@ exfat_fat_next (cluster_t cluster, cluster_t *next)
     return EIO;
   *next = value;
   return 0;
+}
+
+/* Chain the COUNT consecutive clusters from FIRST in the FAT, and
+   make NEXT, a cluster or EXFAT_EOC, follow the last of them.  */
+error_t
+exfat_fat_set_run (cluster_t first, cluster_t count, cluster_t next)
+{
+  error_t err = 0;
+  uint64_t cluster = first;
+  uint64_t end = cluster + count;
+
+  if (count == 0 || !cluster_valid (first) || !cluster_valid (end - 1)
+      || (next != EXFAT_EOC && !cluster_valid (next)))
+    return EIO;
+
+  pthread_mutex_lock (&fat_cache_lock);
+  while (!err && cluster < end)
+    {
+      struct fat_block *slot;
+      uint64_t block_end
+	= (cluster / FAT_BLOCK_ENTRIES + 1) * FAT_BLOCK_ENTRIES;
+      size_t low, high;
+
+      if (block_end > end)
+	block_end = end;
+      err = fat_block (cluster, &slot);
+      if (err)
+	break;
+
+      low = (cluster % FAT_BLOCK_ENTRIES) * sizeof (uint32_t);
+      high = low + (block_end - cluster) * sizeof (uint32_t);
+      for (; cluster < block_end; cluster++)
+	put_le32 (slot->data
+		  + (cluster % FAT_BLOCK_ENTRIES) * sizeof (uint32_t),
+		  cluster + 1 == end ? next : cluster + 1);
+
+      low &= ~(SECTOR_SIZE - 1);
+      high = (high + SECTOR_SIZE - 1) & ~(SECTOR_SIZE - 1);
+      err = exfat_disk_write (vol.fat_offset + (slot->tag - 1) * FAT_BLOCK_SIZE
+			      + low, slot->data + low, high - low);
+      if (err)
+	/* The block no longer says what the disk does.  */
+	slot->tag = 0;
+    }
+  pthread_mutex_unlock (&fat_cache_lock);
+  return err;
+}
+
+/* Forget what was read of the FAT, which may have changed on the
+   disk.  */
+void
+exfat_fat_forget (void)
+{
+  pthread_mutex_lock (&fat_cache_lock);
+  for (size_t i = 0; i < FAT_CACHE_BLOCKS; i++)
+    fat_cache[i].tag = 0;
+  pthread_mutex_unlock (&fat_cache_lock);
 }
 
 

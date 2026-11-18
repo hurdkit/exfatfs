@@ -153,11 +153,13 @@ main (int argc, char **argv)
   return 0;
 }
 
-/* Nothing to do for read-only medium.  */
+/* Read again what is kept of the volume as a whole, which something
+   else changed while it was read-only here.  */
 error_t
 diskfs_reload_global_state (void)
 {
-  return 0;
+  exfat_fat_forget ();
+  return exfat_bitmap_reload ();
 }
 
 /* VolumeDirty is all there is: set before the first write, and

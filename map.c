@@ -272,3 +272,248 @@ exfat_stream_write (struct exfat_stream *stream, off_t offset,
     }
   return 0;
 }
+
+/* Write zeros over the LEN bytes at OFFSET of STREAM, which must lie
+   inside its allocation and end at a multiple of the sector size.
+   OFFSET can be anywhere; what its sector holds before it is kept.  */
+error_t
+exfat_stream_zero (struct exfat_stream *stream, off_t offset, off_t len)
+{
+  error_t err;
+  size_t head = offset & (SECTOR_SIZE - 1);
+
+  if (head && len > 0)
+    {
+      uint8_t sector[4096];
+      size_t n = SECTOR_SIZE - head;
+
+      err = exfat_stream_read (stream, offset - head, sector, SECTOR_SIZE);
+      if (err)
+	return err;
+      memset (sector + head, 0, SECTOR_SIZE - head);
+      err = exfat_stream_write (stream, offset - head, sector, SECTOR_SIZE);
+      if (err)
+	return err;
+      offset += n;
+      len -= n;
+    }
+
+  while (len > 0)
+    {
+      off_t disk_offset, run;
+
+      err = exfat_stream_map (stream, offset, &disk_offset, &run);
+      if (err)
+	return err;
+      if (run > len)
+	run = len;
+      err = exfat_disk_zero (disk_offset, run);
+      if (err)
+	return err;
+      offset += run;
+      len -= run;
+    }
+  return 0;
+}
+
+/* The last cluster of STREAM, which has COUNT clusters and is
+   locked.  */
+static error_t
+last_cluster (struct exfat_stream *stream, cluster_t count, cluster_t *last)
+{
+  if (stream->contiguous)
+    *last = stream->first_cluster + count - 1;
+  else
+    {
+      error_t err = extend_chain (stream, count - 1);
+      const struct exfat_extent *e;
+
+      if (err)
+	return err;
+      for (e = &stream->extents[stream->extent_count - 1];
+	   e->index > count - 1; e--)
+	;
+      *last = e->start + (count - 1 - e->index);
+    }
+  return 0;
+}
+
+/* Make the allocation of STREAM CLUSTERS clusters long, if it is
+   shorter, writing zeros to the new ones if ZERO.  The caller then
+   records the new allocation in whatever names the stream.
+
+   The bitmap is written first, then the FAT entries of the new
+   clusters, and last what joins them to the old ones.  If the
+   translator dies on the way, clusters are marked allocated that
+   nothing uses, and the stream is as it was.  */
+error_t
+exfat_stream_grow (struct exfat_stream *stream, cluster_t clusters, bool zero)
+{
+  error_t err = 0;
+  struct exfat_extent *runs = NULL;
+  size_t run_count = 0, runs_allocated = 0;
+  cluster_t have, need, last = 0, hint = 0;
+
+  pthread_mutex_lock (&stream->lock);
+  have = round_cluster (stream->length) >> vol.cluster_shift;
+  if (clusters <= have)
+    {
+      pthread_mutex_unlock (&stream->lock);
+      return 0;
+    }
+  need = clusters - have;
+
+  if (need > exfat_free_clusters)
+    err = ENOSPC;
+  else if (have)
+    {
+      err = last_cluster (stream, have, &last);
+      hint = last + 1;
+    }
+  while (!err && need)
+    {
+      cluster_t start, count;
+
+      err = exfat_clusters_alloc (hint, need, &start, &count);
+      if (err)
+	break;
+      if (run_count && runs[run_count - 1].start
+	  + runs[run_count - 1].count == start)
+	runs[run_count - 1].count += count;
+      else
+	{
+	  if (run_count == runs_allocated)
+	    {
+	      size_t n = runs_allocated * 2 ?: 8;
+	      struct exfat_extent *new = realloc (runs, n * sizeof *new);
+
+	      if (!new)
+		{
+		  exfat_clusters_free (start, count);
+		  err = ENOMEM;
+		  break;
+		}
+	      runs = new;
+	      runs_allocated = n;
+	    }
+	  runs[run_count++] = (struct exfat_extent) { 0, start, count };
+	}
+      hint = start + count;
+      need -= count;
+    }
+
+  for (size_t i = 0; !err && zero && i < run_count; i++)
+    err = exfat_disk_zero (cluster_offset (runs[i].start),
+			   (off_t) runs[i].count << vol.cluster_shift);
+
+  if (!err && run_count == 1
+      && (have ? stream->contiguous && runs[0].start == last + 1
+	  : true))
+    {
+      /* One run of clusters: the FAT need not describe it.  */
+      if (!have)
+	{
+	  stream->first_cluster = runs[0].start;
+	  stream->contiguous = true;
+	}
+    }
+  else if (!err)
+    {
+      for (size_t i = 0; !err && i < run_count; i++)
+	err = exfat_fat_set_run (runs[i].start, runs[i].count,
+				 i + 1 < run_count
+				 ? runs[i + 1].start : EXFAT_EOC);
+      /* Section 7.6.2.4: once NoFatChain is clear, the FAT has to
+	 describe the clusters the stream already had as well.  */
+      if (!err && have && stream->contiguous)
+	err = exfat_fat_set_run (stream->first_cluster, have, runs[0].start);
+      else if (!err && have)
+	err = exfat_fat_set_run (last, 1, runs[0].start);
+      if (!err)
+	{
+	  if (!have)
+	    stream->first_cluster = runs[0].start;
+	  stream->contiguous = false;
+	}
+    }
+
+  if (err)
+    for (size_t i = 0; i < run_count; i++)
+      exfat_clusters_free (runs[i].start, runs[i].count);
+  else
+    stream->length = (off_t) clusters << vol.cluster_shift;
+  pthread_mutex_unlock (&stream->lock);
+  free (runs);
+  return err;
+}
+
+/* Make the allocation of STREAM CLUSTERS clusters long, if it is
+   longer.  The caller has already recorded the new allocation in
+   whatever names the stream, so that if the translator dies here the
+   chain is longer than its file needs, or clusters are marked
+   allocated that nothing uses, and no file has clusters it lost.  */
+error_t
+exfat_stream_shrink (struct exfat_stream *stream, cluster_t clusters)
+{
+  error_t err = 0;
+  cluster_t have;
+
+  pthread_mutex_lock (&stream->lock);
+  have = round_cluster (stream->length) >> vol.cluster_shift;
+  if (clusters >= have)
+    {
+      pthread_mutex_unlock (&stream->lock);
+      return 0;
+    }
+
+  if (stream->contiguous)
+    err = exfat_clusters_free (stream->first_cluster + clusters,
+			       have - clusters);
+  else
+    {
+      cluster_t last;
+
+      /* This walks the chain to its end, so the extents cover it.  */
+      err = last_cluster (stream, have, &last);
+      if (!err && clusters)
+	{
+	  err = last_cluster (stream, clusters, &last);
+	  if (!err)
+	    err = exfat_fat_set_run (last, 1, EXFAT_EOC);
+	}
+      if (!err)
+	{
+	  size_t kept = 0;
+
+	  for (size_t i = 0; i < stream->extent_count; i++)
+	    {
+	      struct exfat_extent *e = &stream->extents[i];
+	      cluster_t keep = e->index >= clusters ? 0
+		: e->index + e->count <= clusters ? e->count
+		: clusters - e->index;
+
+	      if (keep < e->count)
+		exfat_clusters_free (e->start + keep, e->count - keep);
+	      if (keep)
+		{
+		  e->count = keep;
+		  kept = i + 1;
+		}
+	    }
+	  stream->extent_count = kept;
+	  stream->mapped = clusters;
+	}
+    }
+
+  if (!err)
+    {
+      stream->length = (off_t) clusters << vol.cluster_shift;
+      if (!clusters)
+	{
+	  stream->first_cluster = 0;
+	  stream->contiguous = false;
+	}
+    }
+  pthread_mutex_unlock (&stream->lock);
+  return err;
+}

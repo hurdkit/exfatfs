@@ -160,7 +160,9 @@ struct exfat_stream
   pthread_mutex_t lock;
   cluster_t first_cluster;
   bool contiguous;		/* NoFatChain: the FAT does not describe it.  */
-  off_t length;			/* DataLength.  */
+  /* The clusters allocated are those that LENGTH bytes take.  For a
+     node this is a whole number of clusters.  */
+  off_t length;
 
   /* The part of the FAT chain walked so far, as extents covering
      clusters 0 to MAPPED - 1.  Unused when CONTIGUOUS.  */
@@ -272,6 +274,8 @@ error_t exfat_disk_zero (off_t offset, off_t len);
 error_t exfat_store_flush (void);
 error_t exfat_volume_mark (bool in_use);
 error_t exfat_fat_next (cluster_t cluster, cluster_t *next);
+error_t exfat_fat_set_run (cluster_t first, cluster_t count, cluster_t next);
+void exfat_fat_forget (void);
 
 /* alloc.c */
 error_t exfat_bitmap_load (cluster_t first, uint64_t length);
@@ -295,6 +299,12 @@ error_t exfat_stream_read (struct exfat_stream *stream, off_t offset,
 			   void *buf, size_t len);
 error_t exfat_stream_write (struct exfat_stream *stream, off_t offset,
 			    const void *buf, size_t len);
+error_t exfat_stream_zero (struct exfat_stream *stream, off_t offset,
+			   off_t len);
+error_t exfat_stream_grow (struct exfat_stream *stream, cluster_t clusters,
+			   bool zero);
+error_t exfat_stream_shrink (struct exfat_stream *stream,
+			     cluster_t clusters);
 
 /* entry.c */
 error_t exfat_dir_open (struct exfat_dir *dir, struct exfat_stream *stream,
