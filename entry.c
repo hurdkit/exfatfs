@@ -558,6 +558,22 @@ exfat_set_write_at (off_t offset, bool contiguous,
 			   creating);
 }
 
+/* Return whether one request to the store writes the COUNT entries
+   that start at OFFSET: whether they follow one another on the
+   disk.  */
+bool
+exfat_set_in_one_piece (off_t offset, bool contiguous, unsigned count)
+{
+  off_t at[EXFAT_SET_MAX];
+
+  if (entry_positions (offset, contiguous, count, at))
+    return false;
+  for (unsigned i = 1; i < count; i++)
+    if (at[i] != at[i - 1] + EXFAT_ENTRY_SIZE)
+      return false;
+  return true;
+}
+
 /* Mark the entries of the set whose File entry is at OFFSET as no
    longer in use.  The File entry goes first: without it the rest are
    again secondary entries that no set claims.  */

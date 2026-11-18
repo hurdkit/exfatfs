@@ -358,6 +358,7 @@ error_t exfat_dir_find_free (struct exfat_dir *dir, unsigned count,
 			     off_t *pos);
 error_t exfat_set_write_at (off_t offset, bool contiguous,
 			    const struct exfat_set *set, bool creating);
+bool exfat_set_in_one_piece (off_t offset, bool contiguous, unsigned count);
 error_t exfat_set_delete_at (off_t offset, bool contiguous);
 void exfat_set_create (struct exfat_set *set,
 		       const struct exfat_name_key *name,
@@ -385,6 +386,9 @@ void exfat_inode_move (ino_t ino, const struct exfat_location *where);
 void exfat_inode_detach (ino_t ino);
 error_t exfat_inode_set_dir_cluster (ino_t ino, cluster_t dir_cluster);
 void exfat_inode_forget (ino_t ino);
+
+/* dir.c */
+void exfat_rename_forget (ino_t ino);
 
 /* inode.c */
 void refresh_node_stats (void);

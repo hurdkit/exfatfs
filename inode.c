@@ -186,6 +186,7 @@ void
 diskfs_node_norefs (struct node *np)
 {
   assert_backtrace (!np->dn->pager);
+  exfat_rename_forget (np->cache_id);
   exfat_stream_fini (&np->dn->stream);
   pthread_rwlock_destroy (&np->dn->alloc_lock);
   pthread_mutex_destroy (&np->dn->valid_lock);

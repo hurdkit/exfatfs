@@ -33,10 +33,13 @@ struct dirstat
       DS_NONE,
       DS_DOT,
       DS_DOTDOT,
-      DS_SET			/* An entry set.  */
+      DS_SET,			/* An entry set.  */
+      DS_RENAMED		/* A name that a rename is about to remove.  */
     } kind;
   off_t set_offset;		/* DS_SET: where the set is.  */
-  /* DS_SET: the file.  */
+  /* DS_SET and DS_RENAMED: the file.  DS_NONE, after a lookup for
+     RENAME found no such name: the file whose name differs from it in
+     case only, if there is one.  */
   ino_t ino;
 };
 
@@ -53,6 +56,85 @@ diskfs_drop_dirstat (struct node *dp, struct dirstat *ds)
 {
   ds->kind = DS_NONE;
   return 0;
+}
+
+
+/* libdiskfs renames a file by entering it under its new name and then
+   removing its old name, as for a file with two links.  A file here
+   has one entry set, so entering a file that has one already renames
+   that set, and what is left of the old name is a record here, for
+   the removal that follows to find.  */
+struct renamed
+{
+  struct renamed *next;
+  ino_t dir;			/* The directory the old name was in.  */
+  struct exfat_name_key name;
+  ino_t ino;
+  /* The links libdiskfs counts for the file while it is between its
+     two names.  A record whose removal never came, because the rename
+     failed after the first half, is known by the count having gone
+     back.  */
+  nlink_t links;
+};
+
+static struct renamed *renamed;
+static pthread_mutex_t renamed_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Forget the old name of the file numbered INO.  */
+void
+exfat_rename_forget (ino_t ino)
+{
+  pthread_mutex_lock (&renamed_lock);
+  for (struct renamed **r = &renamed; *r; r = &(*r)->next)
+    if ((*r)->ino == ino)
+      {
+	struct renamed *gone = *r;
+
+	*r = gone->next;
+	free (gone);
+	break;
+      }
+  pthread_mutex_unlock (&renamed_lock);
+}
+
+static error_t
+renamed_add (ino_t dir, const struct exfat_name_key *name, struct node *np)
+{
+  struct renamed *r = malloc (sizeof *r);
+
+  if (!r)
+    return ENOMEM;
+  exfat_rename_forget (np->cache_id);
+  r->dir = dir;
+  r->name = *name;
+  r->ino = np->cache_id;
+  r->links = np->dn_stat.st_nlink;
+  pthread_mutex_lock (&renamed_lock);
+  r->next = renamed;
+  renamed = r;
+  pthread_mutex_unlock (&renamed_lock);
+  return 0;
+}
+
+/* Return the file that had the name NAME in the directory numbered
+   DIR before it was renamed, or zero, and set *LINKS to the links it
+   had then.  */
+static ino_t
+renamed_find (ino_t dir, const struct exfat_name_key *name, nlink_t *links)
+{
+  ino_t ino = 0;
+
+  pthread_mutex_lock (&renamed_lock);
+  for (struct renamed *r = renamed; r && !ino; r = r->next)
+    if (r->dir == dir && r->name.length == name->length
+	&& memcmp (r->name.upcased, name->upcased,
+		   name->length * sizeof *name->upcased) == 0)
+      {
+	ino = r->ino;
+	*links = r->links;
+      }
+  pthread_mutex_unlock (&renamed_lock);
+  return ino;
 }
 
 
@@ -107,6 +189,7 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
   char utf8[EXFAT_UTF8_NAME_MAX + 1];
   bool found = false;
   ino_t inum = 0;
+  nlink_t links;
 
   if (npp)
     *npp = NULL;
@@ -163,6 +246,23 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
   if (!exfat_name_key (name, &key))
     return entering ? EINVAL : ENOENT;
 
+  if (type == REMOVE && (inum = renamed_find (dp->cache_id, &key, &links)))
+    {
+      err = diskfs_cached_lookup (inum, &np);
+      if (err)
+	return err;
+      if (np->dn_stat.st_nlink == links)
+	{
+	  ds->kind = DS_RENAMED;
+	  ds->ino = inum;
+	  *npp = np;
+	  return 0;
+	}
+      /* The rename that left the record never came back for it.  */
+      exfat_rename_forget (inum);
+      diskfs_nput (np);
+    }
+
   set = malloc (sizeof *set);
   if (!set)
     return ENOMEM;
@@ -172,6 +272,8 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
       free (set);
       return err;
     }
+  /* The number is found under the same lock as the set: a rename
+     moves both together.  */
   pthread_rwlock_rdlock (&exfat_entry_lock);
   while (!(err = exfat_dir_next_set (&dir, set, &found)) && found)
     if (exfat_name_match (set, &key))
@@ -191,6 +293,15 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
 
   if (err == ENOENT && entering && !exfat_name_creatable (&key))
     err = EINVAL;
+  else if (!err && type == RENAME && !exfat_name_exact (set, &key))
+    {
+      /* libdiskfs takes a rename onto the file itself as done.  One
+	 that changes the case of the name is not, so the name is
+	 reported free, and diskfs_direnter_hard gets to see whose it
+	 is.  */
+      ds->ino = inum;
+      err = ENOENT;
+    }
   else if (!err)
     {
       if (ds)
@@ -202,6 +313,14 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
       if (npp)
 	{
 	  err = diskfs_cached_lookup (inum, &np);
+	  /* A rename may have moved the set while the node was waited
+	     for.  */
+	  if (!err && (!exfat_inode_location (inum, &where)
+		       || where.set_offset != set->offset))
+	    {
+	      diskfs_nput (np);
+	      err = ENOENT;
+	    }
 	  if (!err)
 	    *npp = np;
 	}
@@ -264,47 +383,111 @@ place_set (struct node *dp, const struct exfat_set *set,
   return 0;
 }
 
+/* Write SET, the entry set of NP, into unused entries of DP, and
+   mark the set at OLD unused if NP had one there.  The new set is
+   whole before the old one goes: if the translator dies between the
+   two, the file is left under both names, sharing its clusters, and
+   not under neither.  */
+static error_t
+enter_set (struct node *dp, struct node *np, const struct exfat_set *set,
+	   const struct exfat_location *old)
+{
+  struct exfat_location new;
+  error_t err = place_set (dp, set, &new);
+
+  if (err)
+    return err;
+  pthread_rwlock_wrlock (&exfat_entry_lock);
+  err = exfat_set_write_at (new.set_offset, new.parent_contiguous, set, true);
+  if (!err && old->set_offset)
+    {
+      err = exfat_set_delete_at (old->set_offset, old->parent_contiguous);
+      if (err)
+	/* Better the old name than both.  */
+	exfat_set_delete_at (new.set_offset, new.parent_contiguous);
+    }
+  if (!err)
+    exfat_inode_move (np->cache_id, &new);
+  pthread_rwlock_unlock (&exfat_entry_lock);
+  return err;
+}
+
 /* Implement the diskfs_direnter_hard callback as described in
-   <hurd/diskfs.h>.  NP gets its entry set here.  A file that has one
-   already has its one name.  */
+   <hurd/diskfs.h>.  NP gets its entry set here if it has none.  If it
+   has one, this is the first half of a rename.  The set gets the new
+   name where it is if one write can do that: if it stays in its
+   directory, takes as many entries as before, and is not split by a
+   cluster boundary.  Otherwise it is written anew.  */
 error_t
 diskfs_direnter_hard (struct node *dp, const char *name, struct node *np,
 		      struct dirstat *ds, struct protid *cred)
 {
   error_t err;
-  struct exfat_name_key key;
-  struct exfat_location old, new;
-  struct exfat_meta meta;
+  ino_t other = ds->ino;
+  struct exfat_name_key key, old_key;
+  struct exfat_location old;
   struct exfat_set *set;
+  unsigned old_count = 0;
 
   ds->kind = DS_NONE;
   if (!exfat_name_key (name, &key) || !exfat_name_creatable (&key))
     return EINVAL;
+  if (other && other != np->cache_id)
+    /* Another file has this name in another case.  libdiskfs would
+       have had to be told so to replace it, and was not, for the sake
+       of the file that changes the case of its own name.  */
+    return EEXIST;
   if (!exfat_inode_location (np->cache_id, &old))
     return ESTALE;
-  if (old.set_offset)
-    return EOPNOTSUPP;
 
   set = malloc (sizeof *set);
   if (!set)
     return ENOMEM;
-  exfat_node_meta (np, &meta);
-  exfat_set_create (set, &key, &meta);
-  err = place_set (dp, set, &new);
-  if (!err)
+  if (old.set_offset)
+    {
+      pthread_rwlock_rdlock (&exfat_entry_lock);
+      err = exfat_set_read_at (old.set_offset, old.parent_contiguous, set);
+      pthread_rwlock_unlock (&exfat_entry_lock);
+      if (!err)
+	{
+	  old_count = set->count;
+	  exfat_name_key_of_set (set, &old_key);
+	  err = exfat_set_rename (set, &key);
+	}
+      if (!err)
+	err = renamed_add (old.parent, &old_key, np);
+    }
+  else
+    {
+      struct exfat_meta meta;
+
+      exfat_node_meta (np, &meta);
+      exfat_set_create (set, &key, &meta);
+      err = 0;
+    }
+
+  if (!err && old.set_offset && old.parent == dp->cache_id
+      && set->count == old_count
+      && exfat_set_in_one_piece (old.set_offset, old.parent_contiguous,
+				 old_count))
     {
       pthread_rwlock_wrlock (&exfat_entry_lock);
-      err = exfat_set_write_at (new.set_offset, new.parent_contiguous, set,
-				true);
-      if (!err)
-	exfat_inode_move (np->cache_id, &new);
+      err = exfat_set_write_at (old.set_offset, old.parent_contiguous, set,
+				false);
       pthread_rwlock_unlock (&exfat_entry_lock);
     }
+  else if (!err)
+    err = enter_set (dp, np, set, &old);
   free (set);
 
-  if (!err)
-    directory_changed (dp);
-  return err;
+  if (err)
+    {
+      if (old.set_offset)
+	exfat_rename_forget (np->cache_id);
+      return err;
+    }
+  directory_changed (dp);
+  return 0;
 }
 
 /* Implement the diskfs_dirremove_hard callback as described in
@@ -321,6 +504,13 @@ diskfs_dirremove_hard (struct node *dp, struct dirstat *ds)
     case DS_DOT:
     case DS_DOTDOT:
       /* The volume does not record these.  */
+      break;
+
+    case DS_RENAMED:
+      /* diskfs_direnter_hard marked the set unused, without DP's
+	 lock.  */
+      exfat_rename_forget (ds->ino);
+      directory_changed (dp);
       break;
 
     case DS_SET:
@@ -340,12 +530,85 @@ diskfs_dirremove_hard (struct node *dp, struct dirstat *ds)
   return err;
 }
 
-/* A name cannot be given to another file yet.  */
+/* Implement the diskfs_dirrewrite_hard callback as described in
+   <hurd/diskfs.h>: the name DS found is to be NP's from now on, and
+   this is the first half of a rename, as in diskfs_direnter_hard.
+   If one write can do it, the set of the file that had the name is
+   overwritten with NP's, so the name is never without a file.
+   Otherwise that set goes first and NP's is written anew.  */
 error_t
 diskfs_dirrewrite_hard (struct node *dp, struct node *np, struct dirstat *ds)
 {
+  error_t err;
+  struct exfat_name_key key, old_key;
+  struct exfat_location old;
+  struct exfat_location new
+    = { ds->set_offset, dp->cache_id, dp->dn->stream.contiguous };
+  struct exfat_set *set;
+  ino_t replaced = ds->ino;
+  unsigned target_count = 0;
+
+  if (ds->kind == DS_DOTDOT)
+    {
+      /* diskfs_direnter_hard records the new parent.  */
+      ds->kind = DS_NONE;
+      return 0;
+    }
+  if (ds->kind != DS_SET)
+    return EINVAL;
   ds->kind = DS_NONE;
-  return EOPNOTSUPP;
+  if (!exfat_inode_location (np->cache_id, &old) || !old.set_offset)
+    return ESTALE;
+
+  set = malloc (sizeof *set);
+  if (!set)
+    return ENOMEM;
+  pthread_rwlock_wrlock (&exfat_entry_lock);
+  err = exfat_set_read_at (new.set_offset, new.parent_contiguous, set);
+  if (!err)
+    {
+      target_count = set->count;
+      exfat_name_key_of_set (set, &key);
+      err = exfat_set_read_at (old.set_offset, old.parent_contiguous, set);
+    }
+  if (!err)
+    {
+      exfat_name_key_of_set (set, &old_key);
+      err = exfat_set_rename (set, &key);
+    }
+  if (!err)
+    err = renamed_add (old.parent, &old_key, np);
+  if (!err && set->count == target_count
+      && exfat_set_in_one_piece (new.set_offset, new.parent_contiguous,
+				 target_count))
+    {
+      err = exfat_set_write_at (new.set_offset, new.parent_contiguous, set,
+				false);
+      if (!err)
+	{
+	  exfat_inode_detach (replaced);
+	  exfat_inode_move (np->cache_id, &new);
+	  err = exfat_set_delete_at (old.set_offset, old.parent_contiguous);
+	}
+      pthread_rwlock_unlock (&exfat_entry_lock);
+    }
+  else
+    {
+      if (!err)
+	err = exfat_set_delete_at (new.set_offset, new.parent_contiguous);
+      if (!err)
+	exfat_inode_detach (replaced);
+      pthread_rwlock_unlock (&exfat_entry_lock);
+      if (!err)
+	err = enter_set (dp, np, set, &old);
+    }
+  free (set);
+
+  if (err)
+    exfat_rename_forget (np->cache_id);
+  else
+    directory_changed (dp);
+  return err;
 }
 
 /* Read the next entry set of DIR that can be opened.  */
