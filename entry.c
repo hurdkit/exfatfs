@@ -701,12 +701,15 @@ exfat_set_changes_apply (struct exfat_set_change *const *changes,
 /* Section 8.2 has the allocations of the unrecognized benign
    secondary entries of a set freed when the set is deleted, and those
    of the unrecognized benign primary entries in a directory when the
-   directory is deleted.  The Linux driver frees them.  Here they are
-   left allocated instead.  Only the entry says that the clusters are
-   its own, and on a damaged or crafted volume that fsck.exfat finds
-   nothing wrong with they are another file's, or the allocation
-   bitmap's: freeing them hands that file's clusters to the next one
-   written.  Telling the two apart takes a walk of every directory on
+   directory is deleted.  The Linux driver frees the first kind,
+   checking only that each cluster is marked allocated, and leaves the
+   second.  Here both are left allocated.  Only the entry says that
+   the clusters are its own, and on a damaged or crafted volume they
+   are another file's, or the allocation bitmap's: freeing them hands
+   them to the next file written, which the Linux driver does.
+   fsck.exfat 1.2.2 cannot tell such a volume from a good one, since
+   it calls every set with a Vendor Allocation entry corrupted.
+   Telling the two apart takes a walk of every directory on
    the volume and every node that also keeps out what is allocated
    while it goes on; the walk this translator had did not, and a file
    that grew meanwhile lost its end.  Leaving them loses nothing.
