@@ -301,6 +301,10 @@ exfat_free_unknown (const struct exfat_alloc *allocs, const bool *known,
       err = scan_volume (&scan);
       if (!err)
 	err = keep_meeting (candidates, count, nodes_meet, NULL);
+      /* The set that named them is to be unused on the medium before
+	 they are free, as in diskfs_truncate.  */
+      if (!err)
+	err = exfat_store_flush ();
       for (unsigned i = 0; i < count; i++)
 	{
 	  if (!candidates[i].kept

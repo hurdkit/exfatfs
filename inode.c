@@ -582,7 +582,13 @@ diskfs_grow (struct node *node, loff_t size, struct protid *cred)
    The entry set gets the new size before the chain is cut and before
    the clusters are freed.  Dying in between leaves a chain longer
    than its file, or clusters allocated that no file has, and never a
-   file whose clusters are free.  */
+   file whose clusters are free.  The store is told to put the set on
+   its medium in between, so that a cache that writes in another order
+   does not let the clusters go to another file while the set still
+   names them; this is also where a file that was removed, or replaced
+   by a rename, frees its clusters, after its set was marked unused.
+   A store that cannot be told so, such as a device without
+   DEV_FLUSH_CACHE, leaves that to the order the medium writes in.  */
 error_t
 diskfs_truncate (struct node *node, loff_t length)
 {
@@ -643,6 +649,8 @@ diskfs_truncate (struct node *node, loff_t length)
 
       diskfs_set_node_times (node);
       err = exfat_node_write_set (node, directory ? allocated : st->st_size);
+      if (!err)
+	err = exfat_store_flush ();
       if (!err)
 	{
 	  /* What a failed shrink freed is freed all the same.  */
