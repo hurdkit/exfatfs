@@ -132,10 +132,6 @@ main (int argc, char **argv)
   fs_uid = default_fs_uid;
   fs_gid = default_fs_gid;
 
-  /* This filesystem is not capable of writing yet.  */
-  diskfs_readonly = 1;
-  diskfs_hard_readonly = 1;
-
   /* Initialize the diskfs library, parse arguments, and open the
      store.  This starts the first diskfs thread for us.  */
   store = diskfs_init_main (&startup_argp, argc, argv, &store_parsed,
@@ -164,15 +160,18 @@ diskfs_reload_global_state (void)
   return 0;
 }
 
+/* VolumeDirty is all there is: set before the first write, and
+   cleared once everything is written.  */
 error_t
 diskfs_set_hypermetadata (int wait, int clean)
 {
-  return 0;
+  if (diskfs_readonly)
+    return 0;
+  return exfat_volume_mark (!clean);
 }
 
 void
 diskfs_readonly_changed (int readonly)
 {
-  /* We should never get here because we set diskfs_hard_readonly above.  */
-  abort ();
+  (*(readonly ? store_set_flags : store_clear_flags)) (store, STORE_READONLY);
 }

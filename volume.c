@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <error.h>
 #include <assert-backtrace.h>
+#include <device/device_types.h>
 #include "exfatfs.h"
 
 struct exfat_volume vol;
@@ -54,6 +55,115 @@ exfat_disk_read (off_t offset, void *buf, size_t len)
   if (data != buf)
     munmap (data, got);
   return err;
+}
+
+
+/* Whether the main boot sector says that the volume is being written
+   from here: VolumeDirty is set and PercentInUse is "not available".
+   And whether VolumeDirty was set when the volume was mounted.
+   Whoever left it set then may have left the volume damaged, which
+   nothing here repairs, so in that case it stays set (section
+   3.1.13.2).  */
+static bool volume_in_use;
+static bool volume_dirty_at_mount;
+static pthread_mutex_t volume_dirty_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static error_t
+raw_write (off_t offset, const void *buf, size_t len)
+{
+  error_t err;
+  size_t wrote;
+
+  assert_backtrace ((offset & (store->block_size - 1)) == 0);
+
+  err = store_write (store, offset >> store->log2_block_size, buf, len,
+		     &wrote);
+  if (!err && wrote != len)
+    err = EIO;
+  return err;
+}
+
+/* Have the store put what was written to it on its medium, if it can
+   be told to.  */
+error_t
+exfat_store_flush (void)
+{
+  error_t err = store_sync (store);
+
+  return err == EOPNOTSUPP || err == D_INVALID_OPERATION ? 0 : err;
+}
+
+/* Record in the main boot sector that the volume is being written, if
+   IN_USE, or that everything written to it is in place.  Section
+   3.1.13.2: VolumeDirty is set while the volume may be inconsistent.
+   Section 3.1.18: PercentInUse either follows the bitmap or says that
+   it does not.  The boot checksum leaves out both fields, so it stays
+   right.  */
+error_t
+exfat_volume_mark (bool in_use)
+{
+  error_t err = 0;
+  uint8_t sector[4096];
+
+  pthread_mutex_lock (&volume_dirty_lock);
+  if (in_use != volume_in_use)
+    {
+      if (!in_use)
+	/* What the flag vouches for must be on the medium before it.  */
+	err = exfat_store_flush ();
+      if (!err)
+	err = exfat_disk_read (0, sector, SECTOR_SIZE);
+      if (!err)
+	{
+	  bool dirty = in_use || volume_dirty_at_mount;
+
+	  put_le16 (sector + 106,
+		    (get_le16 (sector + 106) & ~2U) | (dirty ? 2 : 0));
+	  sector[112] = in_use ? 0xff
+	    : (uint64_t) (vol.cluster_count - exfat_free_clusters) * 100
+	    / vol.cluster_count;
+	  err = raw_write (0, sector, SECTOR_SIZE);
+	}
+      if (!err)
+	{
+	  volume_in_use = in_use;
+	  err = exfat_store_flush ();
+	}
+    }
+  pthread_mutex_unlock (&volume_dirty_lock);
+  return err;
+}
+
+/* Write LEN bytes from BUF at byte OFFSET of the store.  Both must be
+   multiples of the sector size.  Everything written to the volume
+   goes through here, so that VolumeDirty is set before the first
+   write.  */
+error_t
+exfat_disk_write (off_t offset, const void *buf, size_t len)
+{
+  error_t err = exfat_volume_mark (true);
+
+  if (err)
+    return err;
+  return raw_write (offset, buf, len);
+}
+
+error_t
+exfat_disk_zero (off_t offset, off_t len)
+{
+  static const uint8_t zeros[1 << 16];
+
+  while (len > 0)
+    {
+      size_t chunk = len < (off_t) sizeof zeros ? (size_t) len : sizeof zeros;
+      error_t err = exfat_disk_write (offset, zeros, chunk);
+
+      if (err)
+	return err;
+      offset += chunk;
+      len -= chunk;
+    }
+  return 0;
 }
 
 
@@ -233,7 +343,9 @@ read_boot_region (void)
   vol.cluster_count = cluster_count;
   vol.root_cluster = root_cluster;
   vol.active_fat = active_fat;
+  vol.fat_count = fats;
   vol.serial_number = get_le32 (boot + 100);
+  volume_dirty_at_mount = get_le16 (boot + 106) & 2;
 
   free (boot);
 }
@@ -427,4 +539,16 @@ exfat_mount (void)
 {
   read_boot_region ();
   load_system_tables ();
+
+  if (vol.fat_count != 1 && !diskfs_hard_readonly)
+    {
+      /* Section 3.1.9: a second FAT belongs to TexFAT, whose rules for
+	 keeping the two in step are not implemented here.  */
+      error (0, 0, "%s: the volume has two FATs; it can only be read",
+	     diskfs_disk_name);
+      diskfs_readonly = diskfs_hard_readonly = 1;
+    }
+  if (volume_dirty_at_mount && !diskfs_readonly)
+    error (0, 0, "%s: the volume was not unmounted cleanly and may be"
+	   " damaged; fsck.exfat can check it", diskfs_disk_name);
 }

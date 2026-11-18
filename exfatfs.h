@@ -74,6 +74,7 @@ struct exfat_volume
   cluster_t cluster_count;
   cluster_t root_cluster;
   unsigned active_fat;		/* Selects the FAT and the bitmap.  */
+  unsigned fat_count;
   uint32_t serial_number;
 };
 
@@ -98,6 +99,27 @@ static inline uint64_t
 get_le64 (const uint8_t *p)
 {
   return get_le32 (p) | (uint64_t) get_le32 (p + 4) << 32;
+}
+
+static inline void
+put_le16 (uint8_t *p, uint16_t value)
+{
+  p[0] = value;
+  p[1] = value >> 8;
+}
+
+static inline void
+put_le32 (uint8_t *p, uint32_t value)
+{
+  put_le16 (p, value);
+  put_le16 (p + 2, value >> 16);
+}
+
+static inline void
+put_le64 (uint8_t *p, uint64_t value)
+{
+  put_le32 (p, value);
+  put_le32 (p + 4, value >> 32);
 }
 
 static inline bool
@@ -245,6 +267,10 @@ extern cluster_t exfat_free_clusters;
 /* volume.c */
 void exfat_mount (void);
 error_t exfat_disk_read (off_t offset, void *buf, size_t len);
+error_t exfat_disk_write (off_t offset, const void *buf, size_t len);
+error_t exfat_disk_zero (off_t offset, off_t len);
+error_t exfat_store_flush (void);
+error_t exfat_volume_mark (bool in_use);
 error_t exfat_fat_next (cluster_t cluster, cluster_t *next);
 
 /* map.c */
