@@ -51,6 +51,16 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
 		    struct node **npp, struct dirstat *ds,
 		    struct protid *cred)
 {
+  error_t err;
+  bool spec_dotdot = l_flags & SPEC_DOTDOT;
+  enum lookup_type type = l_flags & ~SPEC_DOTDOT;
+  struct disknode *dn = dp->dn;
+  struct node *np = NULL;
+  struct exfat_name_key key;
+  struct exfat_dir dir;
+  struct exfat_set *set;
+  bool found = false;
+
   if (npp)
     *npp = NULL;
 
@@ -64,10 +74,77 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
       return 0;
     }
 
-  /* The root is the only directory so far, and it has no entries.  */
   if (strcmp (name, "..") == 0)
-    return EAGAIN;
-  return ENOENT;
+    {
+      if (dp == diskfs_root_node)
+	return EAGAIN;
+      if (!npp)
+	return 0;
+
+      if (!spec_dotdot)
+	{
+	  /* A directory is locked before the nodes in it.  */
+	  pthread_mutex_unlock (&dp->lock);
+	  err = diskfs_cached_lookup (dn->parent, &np);
+	  pthread_mutex_lock (&dp->lock);
+	}
+      else if (type == LOOKUP)
+	{
+	  ino_t parent = dn->parent;
+
+	  diskfs_nput (dp);
+	  err = diskfs_cached_lookup (parent, &np);
+	}
+      else
+	{
+	  np = diskfs_cached_ifind (dn->parent);
+	  err = 0;
+	}
+      if (!err)
+	*npp = np;
+      return err;
+    }
+
+  if (!exfat_name_key (name, &key))
+    return ENOENT;
+
+  set = malloc (sizeof *set);
+  if (!set)
+    return ENOMEM;
+  err = exfat_dir_open (&dir, &dn->stream, dp == diskfs_root_node);
+  if (err)
+    {
+      free (set);
+      return err;
+    }
+  while (!(err = exfat_dir_next_set (&dir, set, &found)) && found)
+    if (exfat_name_match (set, &key))
+      break;
+  exfat_dir_close (&dir);
+
+  if (!err && !found)
+    err = ENOENT;
+  if (!err)
+    err = set->error;
+  if (!err && npp)
+    {
+      ino_t inum = set->offset / EXFAT_ENTRY_SIZE;
+
+      if (inum == dp->cache_id)
+	/* Only a directory whose clusters hold its own entry can list
+	   itself.  */
+	err = EIO;
+      else
+	err = exfat_record_parent (inum, dp->cache_id,
+				   dn->stream.contiguous);
+      if (!err)
+	err = diskfs_cached_lookup (inum, &np);
+      if (!err)
+	*npp = np;
+    }
+
+  free (set);
+  return err;
 }
 
 error_t
@@ -89,10 +166,36 @@ diskfs_dirrewrite_hard (struct node *dp, struct node *np, struct dirstat *ds)
   return EROFS;
 }
 
+/* Read the next entry set of DIR that a listing shows.  */
+static error_t
+next_listed_set (struct exfat_dir *dir, struct exfat_set *set, bool *found)
+{
+  error_t err;
+
+  do
+    err = exfat_dir_next_set (dir, set, found);
+  while (!err && *found && set->error);
+  return err;
+}
+
 int
 diskfs_dirempty (struct node *dp, struct protid *cred)
 {
-  return 1;
+  error_t err;
+  struct exfat_dir dir;
+  struct exfat_set *set = malloc (sizeof *set);
+  bool found = true;
+
+  if (!set)
+    return 0;
+  err = exfat_dir_open (&dir, &dp->dn->stream, dp == diskfs_root_node);
+  if (!err)
+    {
+      err = next_listed_set (&dir, set, &found);
+      exfat_dir_close (&dir);
+    }
+  free (set);
+  return !err && !found;
 }
 
 #define DIRENT_ALIGN	__alignof__ (struct dirent)
@@ -102,41 +205,143 @@ diskfs_dirempty (struct node *dp, struct protid *cred)
 
 /* Implement the diskfs_get_directs callback as described in
    <hurd/diskfs.h>.  Entries 0 and 1 are `.' and `..', which the volume
-   does not record.  */
+   does not record; entry N + 2 is the Nth entry set of the directory.  */
 error_t
 diskfs_get_directs (struct node *dp, int entry, int nentries, char **data,
 		    mach_msg_type_number_t *datacnt, vm_size_t bufsiz,
 		    int *amt)
 {
-  static const char *const names[] = { ".", ".." };
-  size_t reclen = DIRENT_LEN (2);
+  error_t err = 0;
+  struct disknode *dn = dp->dn;
+  struct exfat_dir dir;
+  struct exfat_set *set;
+  size_t allocsize = bufsiz ? round_page (bufsiz) : 4 * vm_page_size;
+  bool ouralloc = false;
+  bool found = true;
   char *datap;
+  int index = entry;
   int count = 0;
 
-  if (entry < 2 && 2 * reclen > *datacnt)
+  set = malloc (sizeof *set);
+  if (!set)
+    return ENOMEM;
+  err = exfat_dir_open (&dir, &dn->stream, dp == diskfs_root_node);
+  if (err)
     {
-      void *new = mmap (0, vm_page_size, PROT_READ|PROT_WRITE, MAP_ANON, 0, 0);
+      free (set);
+      return err;
+    }
+
+  if (entry > 2)
+    {
+      int at = 0;
+
+      if (dn->readdir_index <= entry - 2)
+	{
+	  at = dn->readdir_index;
+	  dir.pos = dn->readdir_pos;
+	}
+      for (; !err && found && at < entry - 2; at++)
+	err = next_listed_set (&dir, set, &found);
+    }
+
+  if (!err && found && allocsize > *datacnt)
+    {
+      void *new = mmap (0, allocsize, PROT_READ|PROT_WRITE, MAP_ANON, 0, 0);
 
       if (new == MAP_FAILED)
-	return errno;
-      *data = new;
+	err = errno;
+      else
+	{
+	  *data = new;
+	  ouralloc = true;
+	}
     }
   datap = *data;
 
-  for (int index = entry;
-       index < 2 && (nentries == -1 || count < nentries);
-       index++, count++)
+  while (!err && found
+	 && (nentries == -1 || count < nentries)
+	 && (!bufsiz || (vm_size_t) (datap - *data) < bufsiz))
     {
-      struct dirent *userp = (struct dirent *) datap;
+      char name[EXFAT_UTF8_NAME_MAX + 1];
+      size_t namlen, reclen;
+      struct dirent *userp;
+      ino_t inum;
+      unsigned char d_type = DT_DIR;
 
-      userp->d_fileno = dp->cache_id;
-      userp->d_type = DT_DIR;
+      if (index == 0)
+	{
+	  strcpy (name, ".");
+	  namlen = 1;
+	  inum = dp->cache_id;
+	}
+      else if (index == 1)
+	{
+	  strcpy (name, "..");
+	  namlen = 2;
+	  inum = dp == diskfs_root_node ? dp->cache_id : dn->parent;
+	}
+      else
+	{
+	  err = next_listed_set (&dir, set, &found);
+	  if (err || !found)
+	    break;
+	  namlen = exfat_name_to_utf8 (set->name, set->name_length, name);
+	  inum = set->offset / EXFAT_ENTRY_SIZE;
+	  if (!(set->attributes & EXFAT_ATTR_DIRECTORY))
+	    d_type = DT_REG;
+	}
+
+      reclen = DIRENT_LEN (namlen);
+      if (datap - *data + reclen > allocsize)
+	{
+	  size_t newsize = allocsize * 2;
+	  char *new = mmap (0, newsize, PROT_READ|PROT_WRITE, MAP_ANON, 0, 0);
+
+	  if (new == MAP_FAILED)
+	    {
+	      err = errno;
+	      break;
+	    }
+	  memcpy (new, *data, datap - *data);
+	  if (ouralloc)
+	    munmap (*data, allocsize);
+	  datap = new + (datap - *data);
+	  *data = new;
+	  allocsize = newsize;
+	  ouralloc = true;
+	}
+
+      userp = (struct dirent *) datap;
+      userp->d_fileno = inum;
+      userp->d_type = d_type;
       userp->d_reclen = reclen;
-      userp->d_namlen = strlen (names[index]);
-      strcpy (userp->d_name, names[index]);
+      userp->d_namlen = namlen;
+      memcpy (userp->d_name, name, namlen + 1);
+
       datap += reclen;
+      index++;
+      count++;
     }
 
+  if (!err && index >= 2)
+    {
+      dn->readdir_index = index - 2;
+      dn->readdir_pos = dir.pos;
+    }
+  exfat_dir_close (&dir);
+  free (set);
+
+  if (err)
+    {
+      if (ouralloc)
+	munmap (*data, allocsize);
+      return err;
+    }
+
+  if (ouralloc && round_page (datap - *data) < allocsize)
+    munmap (*data + round_page (datap - *data),
+	    allocsize - round_page (datap - *data));
   *amt = count;
   *datacnt = datap - *data;
   return 0;

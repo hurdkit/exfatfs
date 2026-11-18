@@ -21,8 +21,86 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <hurd/ihash.h>
 #include "exfatfs.h"
 #include "libdiskfs/fs_S.h"
+
+/* The directory each node was found in, by inode number.  With this a
+   node is read from the volume by its inode number alone, which is the
+   place of its entry set, whether a lookup just found it or libdiskfs
+   asks for it again later.  The first directory to list an entry keeps
+   it, and a node is recorded here before it can be searched itself, so
+   the links cannot form a loop.  */
+struct parent_link
+{
+  ino_t child;
+  ino_t parent;
+  bool parent_contiguous;
+};
+
+static hurd_ihash_key_t
+hash_inum (const void *key)
+{
+  uint64_t i = *(const ino_t *) key;
+
+  /* The mix function of fasthash, as in libdiskfs's node cache.  */
+  i ^= i >> 23;
+  i *= 0x2127599bf4325c37ULL;
+  i ^= i >> 47;
+  return (hurd_ihash_key_t) i;
+}
+
+static int
+compare_inum (const void *a, const void *b)
+{
+  return *(const ino_t *) a == *(const ino_t *) b;
+}
+
+static struct hurd_ihash parents
+  = HURD_IHASH_INITIALIZER_GKI (HURD_IHASH_NO_LOCP, NULL, NULL,
+				hash_inum, compare_inum);
+static pthread_mutex_t parents_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Remember that the entry set of CHILD is in directory PARENT, unless a
+   directory is already known for it.  */
+error_t
+exfat_record_parent (ino_t child, ino_t parent, bool parent_contiguous)
+{
+  error_t err = 0;
+
+  pthread_mutex_lock (&parents_lock);
+  if (!hurd_ihash_find (&parents, (hurd_ihash_key_t) &child))
+    {
+      struct parent_link *link = malloc (sizeof *link);
+
+      if (!link)
+	err = ENOMEM;
+      else
+	{
+	  *link = (struct parent_link) { child, parent, parent_contiguous };
+	  err = hurd_ihash_add (&parents, (hurd_ihash_key_t) &link->child,
+				link);
+	  if (err)
+	    free (link);
+	}
+    }
+  pthread_mutex_unlock (&parents_lock);
+  return err;
+}
+
+static bool
+find_parent (ino_t child, struct parent_link *link)
+{
+  struct parent_link *found;
+
+  pthread_mutex_lock (&parents_lock);
+  found = hurd_ihash_find (&parents, (hurd_ihash_key_t) &child);
+  if (found)
+    *link = *found;
+  pthread_mutex_unlock (&parents_lock);
+  return found != NULL;
+}
+
 
 /* The user must define this function if she wants to use the node
    cache.  Create and initialize a node.  */
@@ -48,19 +126,52 @@ diskfs_user_read_node (struct node *np, struct lookup_context *ctx)
   struct disknode *dn = np->dn;
   struct stat *st = &np->dn_stat;
 
-  cluster_t clusters;
+  if (np->cache_id == EXFAT_ROOT_INO)
+    {
+      cluster_t clusters;
 
-  /* The root is the only node so far.  */
-  if (np->cache_id != EXFAT_ROOT_INO)
-    return ESTALE;
+      err = exfat_chain_length (vol.root_cluster, &clusters);
+      if (err)
+	return err;
+      exfat_stream_init (&dn->stream, vol.root_cluster, false,
+			 (off_t) clusters << vol.cluster_shift);
+      dn->valid_length = dn->stream.length;
+      dn->attributes = EXFAT_ATTR_DIRECTORY;
+      dn->parent = EXFAT_ROOT_INO;
+    }
+  else
+    {
+      struct parent_link link;
+      struct exfat_set *set;
 
-  err = exfat_chain_length (vol.root_cluster, &clusters);
-  if (err)
-    return err;
-  exfat_stream_init (&dn->stream, vol.root_cluster, false,
-		     (off_t) clusters << vol.cluster_shift);
-  dn->valid_length = dn->stream.length;
-  dn->attributes = EXFAT_ATTR_DIRECTORY;
+      if (!find_parent (np->cache_id, &link))
+	return ESTALE;
+      set = malloc (sizeof *set);
+      if (!set)
+	return ENOMEM;
+      err = exfat_set_read_at ((off_t) np->cache_id * EXFAT_ENTRY_SIZE,
+			       link.parent_contiguous, set);
+      if (err)
+	{
+	  free (set);
+	  return err;
+	}
+
+      dn->parent = link.parent;
+      dn->parent_contiguous = link.parent_contiguous;
+      dn->set_offset = set->offset;
+      exfat_stream_init (&dn->stream, set->first_cluster, set->contiguous,
+			 set->data_length);
+      dn->valid_length = set->valid_length;
+      dn->attributes = set->attributes;
+      dn->create_time = set->create_time;
+      dn->modify_time = set->modify_time;
+      dn->access_time = set->access_time;
+      free (set);
+    }
+
+  dn->readdir_index = 0;
+  dn->readdir_pos = 0;
 
   st->st_fstype = FSTYPE_MSLOSS;
   st->st_fsid = getpid ();
@@ -77,11 +188,19 @@ diskfs_user_read_node (struct node *np, struct lookup_context *ctx)
     st->st_mode = S_IFDIR | 0755;
   else
     st->st_mode = S_IFREG | 0644;
+  if (dn->attributes & EXFAT_ATTR_READONLY)
+    st->st_mode &= ~0222;
 
   st->st_size = dn->stream.length;
   np->allocsize = round_cluster (dn->stream.length);
   st->st_blksize = vm_page_size;
   st->st_blocks = np->allocsize >> 9;
+
+  /* The volume records when a file was created, not when its status
+     last changed; the last modification is the closest to that.  */
+  st->st_mtim = dn->modify_time;
+  st->st_ctim = dn->modify_time;
+  st->st_atim = dn->access_time;
 
   return 0;
 }

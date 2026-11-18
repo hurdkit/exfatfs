@@ -37,8 +37,10 @@ typedef uint32_t cluster_t;
 #define EXFAT_MAX_CLUSTERS	0xfffffff5U
 
 #define EXFAT_ENTRY_SIZE	32
+#define EXFAT_SET_MAX		256	/* A primary and 255 secondaries.  */
 #define EXFAT_NAME_MAX		255	/* In UTF-16 code units.  */
 #define EXFAT_UTF8_NAME_MAX	(EXFAT_NAME_MAX * 3)
+#define EXFAT_DIR_SIZE_MAX	(256 << 20)
 
 #define EXFAT_TYPE_IN_USE	0x80
 #define EXFAT_TYPE_SECONDARY	0x40
@@ -47,7 +49,10 @@ typedef uint32_t cluster_t;
 #define EXFAT_TYPE_UPCASE	0x82
 #define EXFAT_TYPE_LABEL	0x83
 #define EXFAT_TYPE_FILE		0x85
+#define EXFAT_TYPE_STREAM	0xc0
+#define EXFAT_TYPE_NAME		0xc1
 
+#define EXFAT_ATTR_READONLY	0x01
 #define EXFAT_ATTR_DIRECTORY	0x10
 
 /* No directory entry starts at byte 32 of the volume, so no file can
@@ -137,6 +142,32 @@ struct exfat_stream
   cluster_t mapped;
 };
 
+/* A File directory entry set, as read from a directory.  */
+struct exfat_set
+{
+  off_t offset;			/* Byte offset on the volume of the File entry.  */
+  unsigned count;		/* Entries in the set.  */
+  uint8_t raw[EXFAT_SET_MAX * EXFAT_ENTRY_SIZE];
+
+  /* Set once the structure of the set has been checked.  */
+  bool named;
+  uint16_t name[EXFAT_NAME_MAX];
+  unsigned name_length;
+
+  /* EIO when the set failed validation; the fields below are then
+     undefined.  */
+  error_t error;
+  uint16_t name_hash;
+  uint16_t attributes;
+  cluster_t first_cluster;
+  bool contiguous;
+  off_t data_length;
+  off_t valid_length;
+  struct timespec create_time;
+  struct timespec modify_time;
+  struct timespec access_time;
+};
+
 /* A position in a directory.  */
 struct exfat_dir
 {
@@ -149,12 +180,38 @@ struct exfat_dir
   size_t window_length;
 };
 
+/* A name prepared for comparison with the names in a directory.  */
+struct exfat_name_key
+{
+  uint16_t upcased[EXFAT_NAME_MAX];
+  unsigned length;
+  uint16_t hash;
+};
+
 struct disknode
 {
   struct exfat_stream stream;
   off_t valid_length;		/* ValidDataLength.  */
   uint16_t attributes;
+  struct timespec create_time;
+  struct timespec modify_time;
+  struct timespec access_time;
+
+  /* The directory holding this node's entry set, the volume offset of
+     the set's File entry, and whether that directory is contiguous,
+     which is what it takes to find the rest of the set from there.
+     The inode number is SET_OFFSET / EXFAT_ENTRY_SIZE.  */
+  ino_t parent;
+  off_t set_offset;
+  bool parent_contiguous;
+
   struct pager *pager;
+
+  /* The directory offset at which entry set number READDIR_INDEX
+     starts, so that a listing read in pieces is not rescanned from
+     the start for each piece.  */
+  int readdir_index;
+  off_t readdir_pos;
 };
 
 struct user_pager_info
@@ -194,8 +251,17 @@ error_t exfat_dir_open (struct exfat_dir *dir, struct exfat_stream *stream,
 			bool root);
 void exfat_dir_close (struct exfat_dir *dir);
 error_t exfat_dir_next_primary (struct exfat_dir *dir, const uint8_t **entry);
+error_t exfat_dir_next_set (struct exfat_dir *dir, struct exfat_set *set,
+			    bool *found);
+error_t exfat_set_read_at (off_t offset, bool contiguous,
+			   struct exfat_set *set);
+bool exfat_name_key (const char *name, struct exfat_name_key *key);
+bool exfat_name_match (const struct exfat_set *set,
+		       const struct exfat_name_key *key);
+size_t exfat_name_to_utf8 (const uint16_t *name, unsigned length, char *out);
 
 /* inode.c */
+error_t exfat_record_parent (ino_t child, ino_t parent, bool parent_contiguous);
 void refresh_node_stats (void);
 
 /* pager.c */
