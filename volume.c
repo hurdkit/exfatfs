@@ -474,6 +474,12 @@ read_boot_region (void)
   vol.fat_count = fats;
   vol.serial_number = get_le32 (boot + 100);
   volume_stays_dirty = get_le16 (boot + 106) & 2;
+  /* Section 3.1.13.3.  Nothing here sets MediaFailure, and
+     exfat_volume_mark leaves it as it is, so it stays until fsck.exfat
+     or a scan of the medium clears it, as with the Linux driver.  */
+  if (get_le16 (boot + 106) & 4)
+    error (0, 0, "%s: the medium has reported failures, and some data may"
+	   " be lost", diskfs_disk_name);
 
   free (boot);
 }
