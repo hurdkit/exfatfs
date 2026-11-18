@@ -456,11 +456,6 @@ trim_node (struct node *np)
 	 end of the allocation without asking.  */
       || np->conch.holder)
     return;
-  /* A page out there is not part of the file, and must not be there
-     with what it holds when the file grows again.  */
-  if ((off_t) round_page (used) < np->allocsize)
-    discard_node_pages (np, round_page (used),
-			np->allocsize - round_page (used));
   diskfs_truncate (np, np->dn_stat.st_size);
 }
 
@@ -591,6 +586,8 @@ diskfs_truncate (struct node *node, loff_t length)
   struct stat *st = &node->dn_stat;
   bool directory = dn->attributes & EXFAT_ATTR_DIRECTORY;
   cluster_t clusters = round_cluster (length) >> vol.cluster_shift;
+  loff_t page_end = round_page (length);
+  off_t had = node->allocsize;
 
   if (diskfs_check_readonly ())
     return EROFS;
@@ -599,8 +596,6 @@ diskfs_truncate (struct node *node, loff_t length)
 
   if (length < st->st_size)
     {
-      loff_t page_end = round_page (length);
-
       if (!directory && length < page_end)
 	{
 	  /* A page that the kernel holds keeps what the file had past
@@ -619,8 +614,6 @@ diskfs_truncate (struct node *node, loff_t length)
       node->dn_set_mtime = 1;
       node->dn_set_ctime = 1;
       node->dn_stat_dirty = 1;
-      if (page_end < node->allocsize)
-	discard_node_pages (node, page_end, node->allocsize - page_end);
     }
 
   pthread_rwlock_wrlock (&dn->alloc_lock);
@@ -656,6 +649,15 @@ diskfs_truncate (struct node *node, loff_t length)
 	}
     }
   pthread_rwlock_unlock (&dn->alloc_lock);
+
+  /* A page past the end that the kernel holds is not part of the file
+     any more, and would show what it holds if the file grew again.
+     Pages are read in without the node's lock, so one may have been
+     read with the old ValidDataLength until it was cut above.  The
+     discard waits for pages that are being read in, and so for the
+     allocation lock, which is why it comes after.  */
+  if (page_end < had)
+    discard_node_pages (node, page_end, had - page_end);
   return err;
 }
 
