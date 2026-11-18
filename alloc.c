@@ -34,6 +34,9 @@ static struct exfat_stream bitmap_stream;
 /* Where the search for free clusters goes on.  Starting after the last
    allocation keeps files written one after the other contiguous.  */
 static cluster_t rotor;
+/* How many times clusters were freed.  An allocated cluster stays
+   with whatever has it until it is freed.  */
+static uint64_t free_generation;
 static pthread_mutex_t bitmap_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static bool
@@ -177,7 +180,66 @@ exfat_clusters_free (cluster_t start, cluster_t count)
     freed += allocated (n);
   set_bits (at, count, false);
   exfat_free_clusters += freed;
+  free_generation++;
   err = write_bits (at, count);
+  pthread_mutex_unlock (&bitmap_lock);
+  return err;
+}
+
+uint64_t
+exfat_free_generation (void)
+{
+  uint64_t generation;
+
+  pthread_mutex_lock (&bitmap_lock);
+  generation = free_generation;
+  pthread_mutex_unlock (&bitmap_lock);
+  return generation;
+}
+
+/* Free the clusters of the COUNT extents in EXTENTS, which do not
+   overlap, if every one of them is allocated and no cluster was freed
+   since exfat_free_generation returned *GENERATION.  Return EAGAIN if
+   one was, and EIO if a cluster is not allocated.  *GENERATION then
+   counts this one.  */
+error_t
+exfat_clusters_free_unchanged (const struct exfat_extent *extents,
+			       size_t count, uint64_t *generation)
+{
+  error_t err = 0;
+
+  pthread_mutex_lock (&bitmap_lock);
+  if (*generation != free_generation)
+    err = EAGAIN;
+  for (size_t i = 0; !err && i < count; i++)
+    {
+      cluster_t at = extents[i].start - EXFAT_FIRST_CLUSTER;
+
+      if (!cluster_valid (extents[i].start)
+	  || extents[i].count > vol.cluster_count - at)
+	err = EIO;
+      for (cluster_t n = at; !err && n < at + extents[i].count; n++)
+	if (!allocated (n))
+	  err = EIO;
+    }
+  if (!err)
+    {
+      for (size_t i = 0; i < count; i++)
+	{
+	  set_bits (extents[i].start - EXFAT_FIRST_CLUSTER, extents[i].count,
+		    false);
+	  exfat_free_clusters += extents[i].count;
+	}
+      *generation = ++free_generation;
+      for (size_t i = 0; i < count; i++)
+	{
+	  error_t e = write_bits (extents[i].start - EXFAT_FIRST_CLUSTER,
+				  extents[i].count);
+
+	  if (!err)
+	    err = e;
+	}
+    }
   pthread_mutex_unlock (&bitmap_lock);
   return err;
 }

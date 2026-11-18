@@ -54,6 +54,7 @@ typedef uint32_t cluster_t;
 #define EXFAT_TYPE_FILE		0x85
 #define EXFAT_TYPE_STREAM	0xc0
 #define EXFAT_TYPE_NAME		0xc1
+#define EXFAT_TYPE_VENDOR_EXTENSION	0xe0
 
 #define EXFAT_ATTR_READONLY	0x01
 #define EXFAT_ATTR_DIRECTORY	0x10
@@ -211,6 +212,14 @@ struct exfat_set_change
   uint8_t after[EXFAT_SET_MAX * EXFAT_ENTRY_SIZE];
 };
 
+/* An allocation that a directory entry names.  */
+struct exfat_alloc
+{
+  cluster_t first;
+  bool contiguous;
+  uint64_t length;
+};
+
 /* What the entry set of a file says about it, apart from its name.  */
 struct exfat_meta
 {
@@ -286,6 +295,10 @@ struct disknode
   int readdir_index;
   off_t readdir_pos;
   int readdir_hidden;
+
+  /* Every disknode is on one list, so that what the nodes hold can be
+     looked through without their locks.  */
+  struct disknode *next_node, **prev_node;
 };
 
 /* Given to diskfs_cached_lookup_context for a node that is not on the
@@ -341,6 +354,9 @@ error_t exfat_bitmap_reload (void);
 error_t exfat_clusters_alloc (cluster_t hint, cluster_t want,
 			      cluster_t *start, cluster_t *count);
 error_t exfat_clusters_free (cluster_t start, cluster_t count);
+uint64_t exfat_free_generation (void);
+error_t exfat_clusters_free_unchanged (const struct exfat_extent *extents,
+				       size_t count, uint64_t *generation);
 
 /* map.c */
 bool exfat_allocation_valid (cluster_t first, bool contiguous, uint64_t length);
@@ -363,6 +379,8 @@ error_t exfat_stream_grow (struct exfat_stream *stream, cluster_t clusters,
 			   bool zero);
 error_t exfat_stream_shrink (struct exfat_stream *stream,
 			     cluster_t clusters);
+error_t exfat_stream_meets (struct exfat_stream *stream, cluster_t start,
+			    cluster_t count, bool *meets);
 
 /* entry.c */
 error_t exfat_dir_open (struct exfat_dir *dir, struct exfat_stream *stream,
@@ -388,7 +406,8 @@ bool exfat_set_change_in_one_piece (const struct exfat_set_change *change);
 bool exfat_set_change_into_unused (const struct exfat_set_change *change);
 error_t exfat_set_changes_apply (struct exfat_set_change *const *changes,
 				 unsigned count);
-error_t exfat_set_delete_at (off_t offset, bool contiguous);
+error_t exfat_set_delete_at (off_t offset, bool contiguous, uint8_t *raw,
+			     unsigned *count);
 void exfat_set_free_unknown (const uint8_t *raw, unsigned count);
 void exfat_dir_free_benign (struct exfat_dir *dir);
 void exfat_set_create (struct exfat_set *set,
@@ -431,6 +450,11 @@ error_t exfat_node_write_set (struct node *np, off_t data_length);
 void exfat_node_meta (struct node *np, struct exfat_meta *meta);
 void exfat_write_all_nodes (void);
 bool exfat_orphans_hold_clusters (void);
+error_t exfat_nodes_meet (cluster_t start, cluster_t count, bool *meets);
+
+/* unknown.c */
+void exfat_free_unknown (const struct exfat_alloc *allocs,
+			 const bool *known, unsigned count);
 
 /* pager.c */
 void create_file_pagers (void);

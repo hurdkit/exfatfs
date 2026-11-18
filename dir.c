@@ -589,6 +589,8 @@ error_t
 diskfs_dirremove_hard (struct node *dp, struct dirstat *ds)
 {
   error_t err = 0;
+  uint8_t *raw;
+  unsigned count;
 
   switch (ds->kind)
     {
@@ -605,13 +607,24 @@ diskfs_dirremove_hard (struct node *dp, struct dirstat *ds)
       break;
 
     case DS_SET:
+      raw = malloc (EXFAT_SET_MAX * EXFAT_ENTRY_SIZE);
+      if (!raw)
+	{
+	  err = ENOMEM;
+	  break;
+	}
       pthread_rwlock_wrlock (&exfat_entry_lock);
-      err = exfat_set_delete_at (ds->set_offset, dp->dn->stream.contiguous);
+      err = exfat_set_delete_at (ds->set_offset, dp->dn->stream.contiguous,
+				 raw, &count);
       if (!err)
 	exfat_inode_detach (ds->ino);
       pthread_rwlock_unlock (&exfat_entry_lock);
       if (!err)
-	directory_changed (dp);
+	{
+	  exfat_set_free_unknown (raw, count);
+	  directory_changed (dp);
+	}
+      free (raw);
       break;
 
     default:
