@@ -312,10 +312,6 @@ extern struct store *store;
 extern uid_t fs_uid;
 extern gid_t fs_gid;
 
-/* Set by --allow-dirty: a volume that was not unmounted cleanly may
-   be written all the same.  */
-extern bool exfat_allow_dirty;
-
 /* The up-case table of the volume, one entry per UTF-16 code unit.  */
 extern uint16_t *exfat_upcase;
 
@@ -329,7 +325,6 @@ extern pthread_rwlock_t exfat_entry_lock;
 
 /* volume.c */
 void exfat_mount (void);
-void exfat_volume_allow_dirty (void);
 void exfat_volume_damaged (void);
 void exfat_volume_failed (void);
 error_t exfat_disk_read (off_t offset, void *buf, size_t len);

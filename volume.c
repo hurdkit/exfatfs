@@ -84,7 +84,7 @@ static pthread_mutex_t volume_dirty_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool volume_failed;
 
 /* Note that the volume may be damaged: VolumeDirty stays set from now
-   on, and the next mount serves the volume read-only.  */
+   on, so that fsck.exfat checks it.  */
 void
 exfat_volume_damaged (void)
 {
@@ -109,21 +109,6 @@ exfat_volume_failed (void)
 	   " being changed, and what was written could not be taken back;"
 	   " nothing more is written to the volume, which fsck.exfat should"
 	   " check", diskfs_disk_name);
-}
-
-/* Whether the volume is read-only for no other reason than that
-   VolumeDirty was set when it was mounted.  */
-static bool readonly_for_dirty;
-
-/* --allow-dirty was given, at startup or later.  */
-void
-exfat_volume_allow_dirty (void)
-{
-  if (readonly_for_dirty)
-    {
-      readonly_for_dirty = false;
-      diskfs_hard_readonly = 0;
-    }
 }
 
 static error_t
@@ -693,15 +678,12 @@ exfat_mount (void)
     /* Section 3.1.16: a second FAT belongs to TexFAT, whose rules for
        keeping the two in step are not implemented here.  */
     only_read ("the volume has two FATs");
-  if (volume_stays_dirty && !exfat_allow_dirty && !diskfs_hard_readonly)
-    {
-      /* Two entry sets may share clusters after a rename that was cut
-	 short, and freeing those of one would hand the other's to the
-	 next file.  */
-      error (0, 0, "%s: the volume was not unmounted cleanly and may be"
-	     " damaged, so it is read-only; fsck.exfat can repair it, and"
-	     " --allow-dirty lets it be written as it is", diskfs_disk_name);
-      diskfs_readonly = diskfs_hard_readonly = 1;
-      readonly_for_dirty = true;
-    }
+  /* As the Linux driver does, a volume that was not unmounted cleanly
+     is written all the same, and VolumeDirty stays set on it until
+     fsck.exfat clears it.  Two entry sets may share clusters after a
+     rename that was cut short, and removing one then frees the
+     other's; fsck.exfat finds that, and nothing here does.  */
+  if (volume_stays_dirty)
+    error (0, 0, "%s: the volume was not unmounted cleanly, and some data"
+	   " may be damaged; run fsck.exfat on it", diskfs_disk_name);
 }

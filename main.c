@@ -49,16 +49,10 @@ static gid_t default_fs_gid;
 uid_t fs_uid;
 gid_t fs_gid;
 
-bool exfat_allow_dirty;
-
-#define OPT_ALLOW_DIRTY	700
-
 static const struct argp_option options[] =
   {
     { "uid", 'U', "uid", 0, "Default uid for files" },
     { "gid", 'G', "gid", 0, "Default gid for files" },
-    { "allow-dirty", OPT_ALLOW_DIRTY, 0, 0,
-      "Let a volume that was not unmounted cleanly be written" },
     { 0 }
   };
 
@@ -74,10 +68,6 @@ parse_opt (int key, char *arg, struct argp_state *state)
     case 'G':
       fs_gid = atoi (arg);
       refresh_node_stats ();
-      break;
-    case OPT_ALLOW_DIRTY:
-      exfat_allow_dirty = true;
-      exfat_volume_allow_dirty ();
       break;
     case ARGP_KEY_INIT:
       state->child_inputs[0] = state->input;
@@ -124,9 +114,6 @@ diskfs_append_args (char **argz, size_t *argz_len)
       snprintf (buf, sizeof buf, "--gid=%d", fs_gid);
       err = argz_add (argz, argz_len, buf);
     }
-
-  if (!err && exfat_allow_dirty)
-    err = argz_add (argz, argz_len, "--allow-dirty");
 
   if (!err)
     err = store_parsed_append_args (store_parsed, argz, argz_len);
