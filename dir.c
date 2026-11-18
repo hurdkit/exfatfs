@@ -67,6 +67,7 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
   enum lookup_type type = l_flags & ~SPEC_DOTDOT;
   struct disknode *dn = dp->dn;
   struct node *np = NULL;
+  struct exfat_location where;
   struct exfat_name_key key;
   struct exfat_dir dir;
   struct exfat_set *set;
@@ -90,6 +91,8 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
     {
       if (dp == diskfs_root_node)
 	return EAGAIN;
+      if (!exfat_inode_location (dp->cache_id, &where))
+	return ENOENT;
       if (!npp)
 	return 0;
 
@@ -97,19 +100,17 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
 	{
 	  /* A directory is locked before the nodes in it.  */
 	  pthread_mutex_unlock (&dp->lock);
-	  err = diskfs_cached_lookup (dn->parent, &np);
+	  err = diskfs_cached_lookup (where.parent, &np);
 	  pthread_mutex_lock (&dp->lock);
 	}
       else if (type == LOOKUP)
 	{
-	  ino_t parent = dn->parent;
-
 	  diskfs_nput (dp);
-	  err = diskfs_cached_lookup (parent, &np);
+	  err = diskfs_cached_lookup (where.parent, &np);
 	}
       else
 	{
-	  np = diskfs_cached_ifind (dn->parent);
+	  np = diskfs_cached_ifind (where.parent);
 	  err = 0;
 	}
       if (!err)
@@ -146,15 +147,15 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
     err = set->error;
   if (!err && npp)
     {
-      ino_t inum = set->offset / EXFAT_ENTRY_SIZE;
+      ino_t inum;
 
-      if (inum == dp->cache_id)
+      where = (struct exfat_location) { set->offset, dp->cache_id,
+					dn->stream.contiguous };
+      err = exfat_inode_get (&where, &inum);
+      if (!err && inum == dp->cache_id)
 	/* Only a directory whose clusters hold its own entry can list
 	   itself.  */
 	err = EIO;
-      else
-	err = exfat_record_parent (inum, dp->cache_id,
-				   dn->stream.contiguous);
       if (!err)
 	err = diskfs_cached_lookup (inum, &np);
       if (!err)
@@ -196,23 +197,31 @@ next_good_set (struct exfat_dir *dir, struct exfat_set *set, bool *found)
   return err;
 }
 
-/* Read the next entry set of DIR that a listing shows, and write its
-   name to UTF8 and the length of that to *NAMLEN.  Add to *HIDDEN the
-   number of sets passed over because their names are too long.  */
+/* Read the next entry set of DIR, which is open on the directory DP,
+   that a listing shows.  Write its name to UTF8, the length of that
+   to *NAMLEN and its inode number to *INUM.  Add to *HIDDEN the number
+   of sets passed over because their names are too long.  */
 static error_t
-next_listed_set (struct exfat_dir *dir, struct exfat_set *set, bool *found,
-		 char *utf8, size_t *namlen, int *hidden)
+next_listed_set (struct node *dp, struct exfat_dir *dir,
+		 struct exfat_set *set, bool *found, char *utf8,
+		 size_t *namlen, ino_t *inum, int *hidden)
 {
   for (;;)
     {
       error_t err = next_good_set (dir, set, found);
+      struct exfat_location where;
 
       if (err || !*found)
 	return err;
       *namlen = listable_name (set, utf8);
-      if (*namlen)
-	return 0;
-      ++*hidden;
+      if (!*namlen)
+	{
+	  ++*hidden;
+	  continue;
+	}
+      where = (struct exfat_location) { set->offset, dp->cache_id,
+					dp->dn->stream.contiguous };
+      return exfat_inode_get (&where, inum);
     }
 }
 
@@ -279,6 +288,7 @@ diskfs_get_directs (struct node *dp, int entry, int nentries, char **data,
   char *datap;
   char name[EXFAT_UTF8_NAME_MAX + 1];
   size_t namlen;
+  ino_t inum;
   int index = entry;
   int count = 0;
   int hidden = 0;
@@ -304,7 +314,8 @@ diskfs_get_directs (struct node *dp, int entry, int nentries, char **data,
 	  hidden = dn->readdir_hidden;
 	}
       for (; !err && found && at < entry - 2; at++)
-	err = next_listed_set (&dir, set, &found, name, &namlen, &hidden);
+	err = next_listed_set (dp, &dir, set, &found, name, &namlen, &inum,
+			       &hidden);
     }
 
   if (!err && found && allocsize > *datacnt)
@@ -327,7 +338,6 @@ diskfs_get_directs (struct node *dp, int entry, int nentries, char **data,
     {
       size_t reclen;
       struct dirent *userp;
-      ino_t inum;
       unsigned char d_type = DT_DIR;
 
       if (index == 0)
@@ -340,14 +350,26 @@ diskfs_get_directs (struct node *dp, int entry, int nentries, char **data,
 	{
 	  strcpy (name, "..");
 	  namlen = 2;
-	  inum = dp == diskfs_root_node ? dp->cache_id : dn->parent;
+	  if (dp == diskfs_root_node)
+	    inum = dp->cache_id;
+	  else
+	    {
+	      struct exfat_location where;
+
+	      if (!exfat_inode_location (dp->cache_id, &where))
+		{
+		  err = ENOENT;
+		  break;
+		}
+	      inum = where.parent;
+	    }
 	}
       else
 	{
-	  err = next_listed_set (&dir, set, &found, name, &namlen, &hidden);
+	  err = next_listed_set (dp, &dir, set, &found, name, &namlen, &inum,
+				 &hidden);
 	  if (err || !found)
 	    break;
-	  inum = set->offset / EXFAT_ENTRY_SIZE;
 	  if (!(set->attributes & EXFAT_ATTR_DIRECTORY))
 	    d_type = DT_REG;
 	}

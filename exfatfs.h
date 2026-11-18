@@ -58,8 +58,8 @@ typedef uint32_t cluster_t;
 #define EXFAT_ATTR_READONLY	0x01
 #define EXFAT_ATTR_DIRECTORY	0x10
 
-/* No directory entry starts at byte 32 of the volume, so no file can
-   have this inode number.  */
+/* The inode number of the root directory.  The other files are
+   numbered from the next one up.  */
 #define EXFAT_ROOT_INO		1
 
 /* The parameters of the volume, parsed and validated from the main boot
@@ -132,8 +132,9 @@ struct exfat_extent
 /* The allocation of a file, a directory or a system table.  */
 struct exfat_stream
 {
-  /* LOCK protects everything else here.  The length may be read
-     without it by whoever holds the lock of the node it belongs to.  */
+  /* LOCK protects everything else here.  Whoever holds the lock of
+     the node the stream belongs to may read what describes the
+     allocation without it.  */
   pthread_mutex_t lock;
   cluster_t first_cluster;
   bool contiguous;		/* NoFatChain: the FAT does not describe it.  */
@@ -193,6 +194,18 @@ struct exfat_name_key
   uint16_t hash;
 };
 
+/* Where the entry set of a file is.  */
+struct exfat_location
+{
+  off_t set_offset;		/* Volume offset of its File entry.  */
+  ino_t parent;			/* The directory that holds it.  */
+  /* Whether that directory is contiguous, which is what it takes to
+     follow the set from SET_OFFSET across a cluster boundary.  */
+  bool parent_contiguous;
+};
+
+/* What is here is read from the node's entry set.  Where that set is,
+   exfat_inode_location says.  */
 struct disknode
 {
   struct exfat_stream stream;
@@ -201,14 +214,6 @@ struct disknode
   struct timespec create_time;
   struct timespec modify_time;
   struct timespec access_time;
-
-  /* The directory holding this node's entry set, the volume offset of
-     the set's File entry, and whether that directory is contiguous,
-     which is what it takes to find the rest of the set from there.
-     The inode number is SET_OFFSET / EXFAT_ENTRY_SIZE.  */
-  ino_t parent;
-  off_t set_offset;
-  bool parent_contiguous;
 
   struct pager *pager;
 
@@ -270,8 +275,13 @@ bool exfat_name_match (const struct exfat_set *set,
 		       const struct exfat_name_key *key);
 size_t exfat_name_to_utf8 (const uint16_t *name, unsigned length, char *out);
 
+/* vinode.c */
+error_t exfat_inode_get (const struct exfat_location *where, ino_t *ino);
+bool exfat_inode_location (ino_t ino, struct exfat_location *where);
+void exfat_inode_move (ino_t ino, const struct exfat_location *where);
+void exfat_inode_forget (ino_t ino);
+
 /* inode.c */
-error_t exfat_record_parent (ino_t child, ino_t parent, bool parent_contiguous);
 void refresh_node_stats (void);
 
 /* pager.c */

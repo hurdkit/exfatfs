@@ -291,8 +291,8 @@ parse_set (struct exfat_set *set)
 
 /* Read into SET the entry set whose File entry is at byte OFFSET of the
    volume, in a directory that is CONTIGUOUS or not.  This needs nothing
-   else from the directory, so a node can be read back by its inode
-   number alone.  */
+   else from the directory, so a node can be read back from what
+   exfat_inode_location says of it.  */
 error_t
 exfat_set_read_at (off_t offset, bool contiguous, struct exfat_set *set)
 {
