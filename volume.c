@@ -67,6 +67,21 @@ static bool volume_in_use;
 static bool volume_dirty_at_mount;
 static pthread_mutex_t volume_dirty_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Whether the volume is read-only for no other reason than that
+   VolumeDirty was set when it was mounted.  */
+static bool readonly_for_dirty;
+
+/* --allow-dirty was given, at startup or later.  */
+void
+exfat_volume_allow_dirty (void)
+{
+  if (readonly_for_dirty)
+    {
+      readonly_for_dirty = false;
+      diskfs_hard_readonly = 0;
+    }
+}
+
 static error_t
 raw_write (off_t offset, const void *buf, size_t len)
 {
@@ -579,7 +594,15 @@ exfat_mount (void)
 	     diskfs_disk_name);
       diskfs_readonly = diskfs_hard_readonly = 1;
     }
-  if (volume_dirty_at_mount && !diskfs_readonly)
-    error (0, 0, "%s: the volume was not unmounted cleanly and may be"
-	   " damaged; fsck.exfat can check it", diskfs_disk_name);
+  if (volume_dirty_at_mount && !exfat_allow_dirty && !diskfs_hard_readonly)
+    {
+      /* Two entry sets may share clusters after a rename that was cut
+	 short, and freeing those of one would hand the other's to the
+	 next file.  */
+      error (0, 0, "%s: the volume was not unmounted cleanly and may be"
+	     " damaged, so it is read-only; fsck.exfat can repair it, and"
+	     " --allow-dirty lets it be written as it is", diskfs_disk_name);
+      diskfs_readonly = diskfs_hard_readonly = 1;
+      readonly_for_dirty = true;
+    }
 }
