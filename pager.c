@@ -38,28 +38,39 @@ pager_read_page (struct user_pager_info *pager, vm_offset_t page,
 {
   error_t err = 0;
   struct disknode *dn = pager->node->dn;
+  off_t valid;
   void *data;
 
-  *writelock = 1;
+  /* Every page of a file has its clusters, which diskfs_grow sees
+     to.  */
+  *writelock = 0;
 
   data = mmap (0, vm_page_size, PROT_READ|PROT_WRITE, MAP_ANON, 0, 0);
   if (data == MAP_FAILED)
     return errno;
 
+  pthread_rwlock_rdlock (&dn->alloc_lock);
+  pthread_mutex_lock (&dn->valid_lock);
+  valid = dn->valid_length;
+  pthread_mutex_unlock (&dn->valid_lock);
+  if (valid > dn->stream.length)
+    valid = dn->stream.length;
+
   /* What lies past ValidDataLength reads as zeros, whatever the disk
      holds there.  */
-  if ((off_t) page < dn->valid_length)
+  if ((off_t) page < valid)
     {
-      size_t valid = vm_page_size;
+      size_t len = vm_page_size;
       size_t sectors;
 
-      if (dn->valid_length - (off_t) page < (off_t) valid)
-	valid = dn->valid_length - page;
-      sectors = (valid + SECTOR_SIZE - 1) & ~(SECTOR_SIZE - 1);
+      if (valid - (off_t) page < (off_t) len)
+	len = valid - page;
+      sectors = (len + SECTOR_SIZE - 1) & ~(SECTOR_SIZE - 1);
       err = exfat_stream_read (&dn->stream, page, data, sectors);
       if (!err)
-	memset ((char *) data + valid, 0, sectors - valid);
+	memset ((char *) data + len, 0, sectors - len);
     }
+  pthread_rwlock_unlock (&dn->alloc_lock);
 
   if (err)
     munmap (data, vm_page_size);
@@ -68,17 +79,58 @@ pager_read_page (struct user_pager_info *pager, vm_offset_t page,
   return err;
 }
 
+/* Satisfy a pager write request for PAGER, of the page at offset PAGE,
+   from BUF.
+
+   The page is written before ValidDataLength is moved past it, and
+   the entry set gets the new ValidDataLength later still.  If the
+   translator dies in between, the file reads as zeros where it could
+   have read as what was written, and never as what the clusters held
+   before they were the file's.  */
 error_t
 pager_write_page (struct user_pager_info *pager, vm_offset_t page,
 		  vm_address_t buf)
 {
-  return EROFS;
+  error_t err = 0;
+  struct node *node = pager->node;
+  struct disknode *dn = node->dn;
+  off_t end;
+
+  if (dn->attributes & EXFAT_ATTR_DIRECTORY)
+    /* Directories are changed an entry set at a time, never through
+       a mapping.  */
+    return EROFS;
+
+  pthread_rwlock_rdlock (&dn->alloc_lock);
+  end = (off_t) page + vm_page_size;
+  if (end > dn->stream.length)
+    end = dn->stream.length;
+  if ((off_t) page < end)
+    {
+      pthread_mutex_lock (&dn->valid_lock);
+      /* Section 7.6.5.1: what lies between ValidDataLength and the
+	 data written past it is to hold zeros.  */
+      if (dn->valid_length < (off_t) page)
+	err = exfat_stream_zero (&dn->stream, dn->valid_length,
+				 page - dn->valid_length);
+      if (!err)
+	err = exfat_stream_write (&dn->stream, page, (void *) buf,
+				  end - page);
+      if (!err && dn->valid_length < end)
+	{
+	  dn->valid_length = end;
+	  node->dn_stat_dirty = 1;
+	}
+      pthread_mutex_unlock (&dn->valid_lock);
+    }
+  pthread_rwlock_unlock (&dn->alloc_lock);
+  return err;
 }
 
 error_t
 pager_unlock_page (struct user_pager_info *pager, vm_offset_t page)
 {
-  return EROFS;
+  return 0;
 }
 
 void
@@ -87,21 +139,9 @@ pager_notify_evict (struct user_pager_info *pager, vm_offset_t page)
   assert_backtrace (!"unrequested notification on eviction");
 }
 
-error_t
-diskfs_grow (struct node *node, loff_t size, struct protid *cred)
-{
-  return EROFS;
-}
-
-/* This syncs a single file (NODE) to disk.  Nothing is ever dirty.  */
-void
-diskfs_file_update (struct node *node, int wait)
-{
-}
-
-/* Invalidate any pager data associated with NODE.  */
-void
-flush_node_pager (struct node *node)
+/* The pager of NODE with a reference, or null if it has none.  */
+static struct pager *
+node_pager (struct node *node)
 {
   struct pager *pager;
 
@@ -110,6 +150,43 @@ flush_node_pager (struct node *node)
   if (pager)
     ports_port_ref (pager);
   pthread_spin_unlock (&node_to_page_lock);
+  return pager;
+}
+
+/* This syncs a single file (NODE) to disk.  The pages go first: writing
+   them moves ValidDataLength, which the entry set records.  */
+void
+diskfs_file_update (struct node *node, int wait)
+{
+  struct pager *pager = node_pager (node);
+
+  if (pager)
+    {
+      pager_sync (pager, wait);
+      ports_port_deref (pager);
+    }
+  diskfs_node_update (node, wait);
+}
+
+/* Have the kernel drop the pages it holds of the LEN bytes at OFFSET of
+   NODE, without writing them.  */
+void
+discard_node_pages (struct node *node, off_t offset, off_t len)
+{
+  struct pager *pager = node_pager (node);
+
+  if (pager)
+    {
+      pager_flush_some (pager, offset, len, 1);
+      ports_port_deref (pager);
+    }
+}
+
+/* Invalidate any pager data associated with NODE.  */
+void
+flush_node_pager (struct node *node)
+{
+  struct pager *pager = node_pager (node);
 
   if (pager)
     {
@@ -181,6 +258,12 @@ diskfs_get_filemap (struct node *node, vm_prot_t prot)
   assert_backtrace (S_ISDIR (node->dn_stat.st_mode)
 		    || S_ISREG (node->dn_stat.st_mode));
 
+  if (S_ISDIR (node->dn_stat.st_mode) && (prot & VM_PROT_WRITE))
+    {
+      errno = EISDIR;
+      return MACH_PORT_NULL;
+    }
+
   /* A pager can only report a bad chain as a memory error, which the
      reader takes as a signal.  Find out now, while the caller can still
      be told EIO.  */
@@ -220,7 +303,10 @@ diskfs_get_filemap (struct node *node, vm_prot_t prot)
     }
   pthread_spin_unlock (&node_to_page_lock);
 
-  right = pager_create_ro_port (pager);
+  if (prot & VM_PROT_WRITE)
+    right = ports_get_send_right (pager);
+  else
+    right = pager_create_ro_port (pager);
   ports_port_deref (pager);
 
   assert_backtrace (MACH_PORT_VALID (right));
@@ -230,13 +316,7 @@ diskfs_get_filemap (struct node *node, vm_prot_t prot)
 static void
 set_node_pager_caching (struct node *node, int may_cache)
 {
-  struct pager *pager;
-
-  pthread_spin_lock (&node_to_page_lock);
-  pager = node->dn->pager;
-  if (pager)
-    ports_port_ref (pager);
-  pthread_spin_unlock (&node_to_page_lock);
+  struct pager *pager = node_pager (node);
 
   if (pager)
     {
@@ -272,7 +352,8 @@ diskfs_get_filemap_pager_struct (struct node *node)
   return node->dn->pager;
 }
 
-/* Shutdown all the pagers.  */
+/* Shutdown all the pagers, which writes their pages, and then write
+   the entry sets, which record how far the pages got.  */
 void
 diskfs_shutdown_pager (void)
 {
@@ -283,12 +364,23 @@ diskfs_shutdown_pager (void)
     }
 
   ports_bucket_iterate (file_pager_bucket, shutdown_one);
+  exfat_write_all_nodes ();
 }
 
-/* Sync all the pagers.  Nothing is ever dirty.  */
+/* Sync all the pagers and then the entry sets.  */
 void
 diskfs_sync_everything (int wait)
 {
+  error_t sync_one (void *v_p)
+    {
+      pager_sync (v_p, wait);
+      return 0;
+    }
+
+  ports_bucket_iterate (file_pager_bucket, sync_one);
+  exfat_write_all_nodes ();
+  if (wait)
+    exfat_store_flush ();
 }
 
 static void

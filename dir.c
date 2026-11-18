@@ -153,9 +153,11 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
       free (set);
       return err;
     }
+  pthread_rwlock_rdlock (&exfat_entry_lock);
   while (!(err = exfat_dir_next_set (&dir, set, &found)) && found)
     if (exfat_name_match (set, &key))
       break;
+  pthread_rwlock_unlock (&exfat_entry_lock);
   exfat_dir_close (&dir);
 
   if (!err && !found)
@@ -274,7 +276,9 @@ diskfs_dirempty (struct node *dp, struct protid *cred)
   err = exfat_dir_open (&dir, &dp->dn->stream, dp == diskfs_root_node);
   if (!err)
     {
+      pthread_rwlock_rdlock (&exfat_entry_lock);
       err = next_good_set (&dir, set, &found);
+      pthread_rwlock_unlock (&exfat_entry_lock);
       exfat_dir_close (&dir);
     }
   free (set);
@@ -319,6 +323,7 @@ diskfs_get_directs (struct node *dp, int entry, int nentries, char **data,
       free (set);
       return err;
     }
+  pthread_rwlock_rdlock (&exfat_entry_lock);
 
   if (entry > 2)
     {
@@ -429,6 +434,7 @@ diskfs_get_directs (struct node *dp, int entry, int nentries, char **data,
       dn->readdir_pos = dir.pos;
       dn->readdir_hidden = hidden;
     }
+  pthread_rwlock_unlock (&exfat_entry_lock);
   if (!err && !found && hidden)
     report_hidden_names (hidden);
   exfat_dir_close (&dir);

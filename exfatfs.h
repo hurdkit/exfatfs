@@ -252,11 +252,18 @@ struct exfat_location
 struct disknode
 {
   struct exfat_stream stream;
-  off_t valid_length;		/* ValidDataLength.  */
+  /* Held for writing while the allocation changes, and for reading by
+     the pager, which uses the allocation without the node's lock.  */
+  pthread_rwlock_t alloc_lock;
+
+  /* ValidDataLength: the disk holds the file's data up to here, and
+     what follows reads as zeros.  The pager moves it as it writes
+     pages out, under VALID_LOCK.  */
+  pthread_mutex_t valid_lock;
+  off_t valid_length;
+
   uint16_t attributes;
   struct timespec create_time;
-  struct timespec modify_time;
-  struct timespec access_time;
 
   struct pager *pager;
 
@@ -284,6 +291,12 @@ extern gid_t fs_gid;
 extern uint16_t *exfat_upcase;
 
 extern cluster_t exfat_free_clusters;
+
+/* Held for reading while directory entries are read and for writing
+   while they change.  A node's entry set is written under the node's
+   lock, not under that of the directory that holds it, so the lock of
+   a directory does not keep its entries still.  */
+extern pthread_rwlock_t exfat_entry_lock;
 
 /* volume.c */
 void exfat_mount (void);
@@ -368,11 +381,15 @@ void exfat_inode_forget (ino_t ino);
 
 /* inode.c */
 void refresh_node_stats (void);
+error_t exfat_node_grow (struct node *np, off_t size);
+error_t exfat_node_write_set (struct node *np, off_t data_length);
+void exfat_write_all_nodes (void);
 
 /* pager.c */
 void create_file_pagers (void);
 void drop_pager_softrefs (struct node *node);
 void allow_pager_softrefs (struct node *node);
 void flush_node_pager (struct node *node);
+void discard_node_pages (struct node *node, off_t offset, off_t len);
 
 #endif /* EXFATFS_H */
