@@ -306,6 +306,19 @@ node_meta (struct node *np, off_t data_length, struct exfat_meta *meta)
     }
 }
 
+/* Note that what NP, which is locked, holds is changing: its data or
+   its size.  As MS-DOS does, that sets the Archive attribute of a
+   file (section 7.4.4).  It is an access as well, so LastAccessed
+   moves with LastModified (section 7.4.7).  Setting the times with
+   utimes afterwards still has the last word.  */
+void
+exfat_node_modified (struct node *np)
+{
+  if (!(np->dn->attributes & EXFAT_ATTR_DIRECTORY))
+    np->dn->attributes |= EXFAT_ATTR_ARCHIVE;
+  np->dn_set_atime = 1;
+}
+
 /* Write the entry set of NP, which is locked, with DATA_LENGTH as the
    size.  A file that has no entry set is left alone.  So is a set
    that would change in its time of last access alone: reading a file
@@ -519,6 +532,7 @@ diskfs_grow (struct node *node, loff_t size, struct protid *cred)
 {
   if (diskfs_check_readonly ())
     return EROFS;
+  exfat_node_modified (node);
   return exfat_node_grow (node, size);
 }
 
@@ -560,6 +574,7 @@ diskfs_truncate (struct node *node, loff_t length)
 	    return err;
 	}
       st->st_size = length;
+      exfat_node_modified (node);
       node->dn_set_mtime = 1;
       node->dn_set_ctime = 1;
       node->dn_stat_dirty = 1;

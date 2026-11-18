@@ -343,6 +343,7 @@ directory_changed (struct node *dp)
   dp->dn->readdir_index = 0;
   dp->dn->readdir_pos = 0;
   dp->dn->readdir_hidden = 0;
+  exfat_node_modified (dp);
   dp->dn_set_mtime = 1;
   dp->dn_set_ctime = 1;
 }

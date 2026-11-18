@@ -424,6 +424,7 @@ void exfat_rename_forget (ino_t ino);
 /* inode.c */
 void refresh_node_stats (void);
 error_t exfat_node_grow (struct node *np, off_t size);
+void exfat_node_modified (struct node *np);
 error_t exfat_node_write_set (struct node *np, off_t data_length);
 void exfat_node_meta (struct node *np, struct exfat_meta *meta);
 void exfat_write_all_nodes (void);

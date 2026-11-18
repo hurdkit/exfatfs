@@ -263,6 +263,8 @@ diskfs_get_filemap (struct node *node, vm_prot_t prot)
       errno = EISDIR;
       return MACH_PORT_NULL;
     }
+  if (prot & VM_PROT_WRITE)
+    exfat_node_modified (node);
 
   /* A pager can only report a bad chain as a memory error, which the
      reader takes as a signal.  Find out now, while the caller can still
