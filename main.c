@@ -175,14 +175,16 @@ diskfs_reload_global_state (void)
   return exfat_bitmap_reload ();
 }
 
-/* VolumeDirty is all there is: set before the first write, and
-   cleared once everything is written.  */
+/* VolumeDirty is all there is.  exfat_disk_write sets it before the
+   first write, so here it is only cleared, once everything is written.
+   libdiskfs asks for the volume to be marked as in use sooner than
+   that: before it so much as notes that a file was read.  */
 error_t
 diskfs_set_hypermetadata (int wait, int clean)
 {
-  if (diskfs_readonly)
+  if (diskfs_readonly || !clean)
     return 0;
-  return exfat_volume_mark (!clean);
+  return exfat_volume_mark (false);
 }
 
 void

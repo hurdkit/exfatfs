@@ -272,7 +272,10 @@ diskfs_set_statfs (struct statfs *st)
 
 /* Write the entry set of NP, which is locked, with the allocation that
    starts at FIRST_CLUSTER and is CONTIGUOUS or not, and DATA_LENGTH as
-   the size.  A file that has no entry set is left alone.  */
+   the size.  A file that has no entry set is left alone.  So is a set
+   that would change in its time of last access alone: reading a file
+   does not write to the volume, and the time is recorded along with
+   the next change that is.  */
 static error_t
 write_set (struct node *np, cluster_t first_cluster, bool contiguous,
 	   off_t data_length)
@@ -312,7 +315,7 @@ write_set (struct node *np, cluster_t first_cluster, bool contiguous,
     {
       err = exfat_set_read_at (where.set_offset, where.parent_contiguous,
 			       set);
-      if (!err)
+      if (!err && exfat_set_differs (set, &meta))
 	{
 	  exfat_set_update (set, &meta);
 	  err = exfat_set_write_at (where.set_offset, where.parent_contiguous,

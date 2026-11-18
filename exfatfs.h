@@ -368,6 +368,8 @@ error_t exfat_set_delete_at (off_t offset, bool contiguous);
 void exfat_set_create (struct exfat_set *set,
 		       const struct exfat_name_key *name,
 		       const struct exfat_meta *meta);
+bool exfat_set_differs (const struct exfat_set *set,
+			const struct exfat_meta *meta);
 void exfat_set_update (struct exfat_set *set, const struct exfat_meta *meta);
 error_t exfat_set_rename (struct exfat_set *set,
 			  const struct exfat_name_key *name);

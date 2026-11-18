@@ -613,6 +613,25 @@ exfat_set_delete_at (off_t offset, bool contiguous)
   return err;
 }
 
+/* Return whether META says something that SET, which was read and
+   found good, does not, the time of last access aside.  The time of
+   last modification is compared as the volume records it.  */
+bool
+exfat_set_differs (const struct exfat_set *set, const struct exfat_meta *meta)
+{
+  uint32_t stamp, meta_stamp;
+  uint8_t increment, meta_increment;
+
+  encode_time (set->modify_time, &stamp, &increment);
+  encode_time (meta->modify_time, &meta_stamp, &meta_increment);
+  return set->attributes != meta->attributes
+    || set->first_cluster != meta->first_cluster
+    || set->contiguous != meta->contiguous
+    || set->data_length != meta->data_length
+    || set->valid_length != meta->valid_length
+    || stamp != meta_stamp || increment != meta_increment;
+}
+
 static void
 seal_set (struct exfat_set *set)
 {
