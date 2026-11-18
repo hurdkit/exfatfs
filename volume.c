@@ -31,6 +31,17 @@ uint16_t *exfat_upcase;
 #define refuse(fmt, ...) \
   error (1, 0, "%s: " fmt, diskfs_disk_name, ##__VA_ARGS__)
 
+/* Serve the volume read-only, saying why, unless it is already.  */
+#define only_read(fmt, ...) \
+  do \
+    if (!diskfs_hard_readonly) \
+      { \
+	error (0, 0, "%s: " fmt "; it can only be read", \
+	       diskfs_disk_name, ##__VA_ARGS__); \
+	diskfs_readonly = diskfs_hard_readonly = 1; \
+      } \
+  while (0)
+
 /* Read LEN bytes at byte OFFSET of the store into BUF.  Both must be
    multiples of the sector size.  */
 error_t
@@ -419,6 +430,10 @@ read_boot_region (void)
 
   if (boot[105] != 1)
     refuse ("unsupported exFAT revision %u.%02u", boot[105], boot[104]);
+  /* Section 3.1.12: writing is to follow the minor revision's
+     specification, and there is none past 99.  */
+  if (boot[104] > 99)
+    only_read ("exFAT revision 1.%u is not a valid revision", boot[104]);
 
   fats = boot[110];
   active_fat = get_le16 (boot + 106) & 1;
@@ -536,6 +551,18 @@ load_upcase_table (cluster_t first, uint64_t length, uint32_t checksum)
 	refuse ("the up-case table describes more than 65536 characters");
     }
   free (data);
+
+  /* Section 7.2.5: the first 128 mappings are fixed, and a table with
+     others is invalid.  Implementations that fold ASCII by those
+     rules, and not by the table, would see two of the names created
+     here as one, or not find them by their NameHash.  */
+  for (uint16_t c = 0; c < 128; c++)
+    if (exfat_upcase[c] != (c >= 'a' && c <= 'z' ? c - 'a' + 'A' : c))
+      {
+	only_read ("the up-case table maps %04Xh to %04Xh, which section"
+		   " 7.2.5 does not allow", c, exfat_upcase[c]);
+	break;
+      }
 }
 
 /* Find the allocation bitmap and the up-case table in the root
@@ -629,14 +656,10 @@ exfat_mount (void)
   read_boot_region ();
   load_system_tables ();
 
-  if (vol.fat_count != 1 && !diskfs_hard_readonly)
-    {
-      /* Section 3.1.16: a second FAT belongs to TexFAT, whose rules for
-	 keeping the two in step are not implemented here.  */
-      error (0, 0, "%s: the volume has two FATs; it can only be read",
-	     diskfs_disk_name);
-      diskfs_readonly = diskfs_hard_readonly = 1;
-    }
+  if (vol.fat_count != 1)
+    /* Section 3.1.16: a second FAT belongs to TexFAT, whose rules for
+       keeping the two in step are not implemented here.  */
+    only_read ("the volume has two FATs");
   if (volume_stays_dirty && !exfat_allow_dirty && !diskfs_hard_readonly)
     {
       /* Two entry sets may share clusters after a rename that was cut
