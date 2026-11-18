@@ -45,6 +45,37 @@ diskfs_user_make_node (struct node **npp, struct lookup_context *ctx)
   return 0;
 }
 
+/* Return the number of directories in the directory NP.  The volume
+   records no `..', but libdiskfs counts one link to a directory for
+   each directory in it.  Every File entry that says it is a directory
+   counts, whether a lookup would accept its set or not: too many
+   links keep a directory, too few would have it freed while it is in
+   use.  */
+static nlink_t
+count_subdirectories (struct node *np)
+{
+  struct exfat_dir dir;
+  nlink_t count = 0;
+
+  if (exfat_dir_open (&dir, &np->dn->stream, np->cache_id == EXFAT_ROOT_INO))
+    return 0;
+  pthread_rwlock_rdlock (&exfat_entry_lock);
+  for (;;)
+    {
+      const uint8_t *entry;
+
+      if (exfat_dir_next_primary (&dir, &entry) || !entry)
+	break;
+      if (entry[0] == EXFAT_TYPE_FILE
+	  && (get_le16 (entry + 4) & EXFAT_ATTR_DIRECTORY))
+	count++;
+      dir.pos += EXFAT_ENTRY_SIZE;
+    }
+  pthread_rwlock_unlock (&exfat_entry_lock);
+  exfat_dir_close (&dir);
+  return count;
+}
+
 static mode_t
 node_mode (const struct disknode *dn)
 {
@@ -56,13 +87,15 @@ node_mode (const struct disknode *dn)
 }
 
 /* The user must define this function if she wants to use the node
-   cache.  Read stat information out of the on-disk node.  */
+   cache.  Read stat information out of the on-disk node, or with CTX
+   set up a file that is not on the disk yet.  */
 error_t
 diskfs_user_read_node (struct node *np, struct lookup_context *ctx)
 {
   error_t err;
   struct disknode *dn = np->dn;
   struct stat *st = &np->dn_stat;
+  bool directory;
 
   if (np->cache_id == EXFAT_ROOT_INO)
     {
@@ -77,6 +110,15 @@ diskfs_user_read_node (struct node *np, struct lookup_context *ctx)
       dn->attributes = EXFAT_ATTR_DIRECTORY;
       st->st_size = dn->stream.length;
       st->st_mtim = st->st_atim = (struct timespec) { 0, 0 };
+    }
+  else if (ctx)
+    {
+      dn->attributes = S_ISDIR (ctx->mode)
+	? EXFAT_ATTR_DIRECTORY
+	: EXFAT_ATTR_ARCHIVE | (ctx->mode & 0222 ? 0 : EXFAT_ATTR_READONLY);
+      clock_gettime (CLOCK_REALTIME, &dn->create_time);
+      st->st_size = 0;
+      st->st_mtim = st->st_atim = dn->create_time;
     }
   else
     {
@@ -109,6 +151,7 @@ diskfs_user_read_node (struct node *np, struct lookup_context *ctx)
       st->st_atim = set->access_time;
       free (set);
     }
+  directory = dn->attributes & EXFAT_ATTR_DIRECTORY;
 
   dn->readdir_index = 0;
   dn->readdir_pos = 0;
@@ -119,7 +162,7 @@ diskfs_user_read_node (struct node *np, struct lookup_context *ctx)
   st->st_ino = np->cache_id;
   st->st_gen = 0;
   st->st_rdev = 0;
-  st->st_nlink = 1;
+  st->st_nlink = directory ? 2 + (ctx ? 0 : count_subdirectories (np)) : 1;
   st->st_uid = fs_uid;
   st->st_gid = fs_gid;
   st->st_author = fs_uid;
@@ -299,6 +342,36 @@ node_data_length (struct node *np)
       || round_cluster (np->dn_stat.st_size) != np->allocsize)
     return np->allocsize;
   return np->dn_stat.st_size;
+}
+
+/* Set *META to what the entry set of NP, which is locked, is to say,
+   for a set that is yet to be made.  */
+void
+exfat_node_meta (struct node *np, struct exfat_meta *meta)
+{
+  struct disknode *dn = np->dn;
+  bool directory = dn->attributes & EXFAT_ATTR_DIRECTORY;
+
+  *meta = (struct exfat_meta)
+    {
+      .attributes = dn->attributes,
+      .first_cluster = dn->stream.first_cluster,
+      .contiguous = dn->stream.contiguous,
+      .data_length = node_data_length (np),
+      .create_time = dn->create_time,
+      .modify_time = np->dn_stat.st_mtim,
+      .access_time = np->dn_stat.st_atim,
+    };
+  meta->valid_length = meta->data_length;
+  if (!directory)
+    {
+      if (np->dn_stat.st_size < meta->valid_length)
+	meta->valid_length = np->dn_stat.st_size;
+      pthread_mutex_lock (&dn->valid_lock);
+      if (dn->valid_length < meta->valid_length)
+	meta->valid_length = dn->valid_length;
+      pthread_mutex_unlock (&dn->valid_lock);
+    }
 }
 
 /* Sync the info in NP->dn_stat and any associated format-specific
@@ -482,17 +555,102 @@ diskfs_truncate (struct node *node, loff_t length)
   return err;
 }
 
-/* Files cannot be made or removed yet.  */
-
+/* Allocate a new node to be of mode MODE in locked directory DIR; set
+   *NODE to it, locked.  It gets its entry set when it is entered in a
+   directory.  A directory gets its first cluster here.  */
 error_t
 diskfs_alloc_node (struct node *dir, mode_t mode, struct node **node)
 {
-  return EROFS;
+  error_t err;
+  struct lookup_context ctx = { mode };
+  struct node *np;
+  ino_t ino;
+
+  err = exfat_inode_new (dir->cache_id, &ino);
+  if (err)
+    return err;
+  err = diskfs_cached_lookup_context (ino, &np, &ctx);
+  if (err)
+    {
+      exfat_inode_forget (ino);
+      return err;
+    }
+  if (S_ISDIR (mode))
+    {
+      err = exfat_node_grow (np, CLUSTER_SIZE);
+      if (err)
+	{
+	  np->dn_stat.st_nlink = 0;
+	  diskfs_nput (np);
+	  return err;
+	}
+    }
+  *node = np;
+  return 0;
 }
 
+/* Free node NP, which has no entry set and no clusters any more.  */
 void
 diskfs_free_node (struct node *np, mode_t old_mode)
 {
+  exfat_inode_forget (np->cache_id);
+}
+
+/* libdiskfs's definition of diskfs_create_node comes with this.  */
+int _diskfs_no_inherit_dir_group;
+
+/* Create a new node in DIR under NAME, as described in
+   <hurd/diskfs.h>.  libdiskfs's own version links `.' and `..' into a
+   new directory, which the volume does not record, and gives a file
+   the owner and the mode it was asked for, which the volume cannot
+   record either.  */
+error_t
+diskfs_create_node (struct node *dir, const char *name, mode_t mode,
+		    struct node **newnode, struct protid *cred,
+		    struct dirstat *ds)
+{
+  error_t err;
+  struct node *np;
+
+  *newnode = NULL;
+  if (diskfs_check_readonly ())
+    err = EROFS;
+  else if (!name || (!S_ISDIR (mode) && !S_ISREG (mode)))
+    /* A file exists by its entry set, which has to have a name, and
+       is a directory or a regular file.  */
+    err = EOPNOTSUPP;
+  else
+    err = diskfs_alloc_node (dir, mode, &np);
+  if (err)
+    {
+      if (name)
+	diskfs_drop_dirstat (dir, ds);
+      return err;
+    }
+
+  err = diskfs_direnter (dir, name, np, ds, cred);
+  if (err)
+    {
+      np->dn_stat.st_nlink = 0;
+      diskfs_nput (np);
+      return err;
+    }
+  if (S_ISDIR (mode))
+    {
+      /* For the `..' of the new directory.  */
+      dir->dn_stat.st_nlink++;
+      dir->dn_set_ctime = 1;
+    }
+  *newnode = np;
+  return 0;
+}
+
+/* A file is its entry set, and has one name.  */
+kern_return_t
+diskfs_S_dir_link (struct protid *dircred, struct protid *filecred,
+		   const_string_t name, int excl)
+{
+  return dircred ? EPERM : EOPNOTSUPP;
 }
 
 /* The owner and the group of every file are those the translator was

@@ -25,11 +25,19 @@
 #include <error.h>
 #include "exfatfs.h"
 
-/* Nothing is carried from a lookup to a later directory change while
-   the file system cannot be written.  */
+/* What a lookup found, for the directory change that follows it.  */
 struct dirstat
 {
-  int unused;
+  enum
+    {
+      DS_NONE,
+      DS_DOT,
+      DS_DOTDOT,
+      DS_SET			/* An entry set.  */
+    } kind;
+  off_t set_offset;		/* DS_SET: where the set is.  */
+  /* DS_SET: the file.  */
+  ino_t ino;
 };
 
 const size_t diskfs_dirstat_size = sizeof (struct dirstat);
@@ -37,13 +45,16 @@ const size_t diskfs_dirstat_size = sizeof (struct dirstat);
 void
 diskfs_null_dirstat (struct dirstat *ds)
 {
+  memset (ds, 0, sizeof *ds);
 }
 
 error_t
 diskfs_drop_dirstat (struct node *dp, struct dirstat *ds)
 {
+  ds->kind = DS_NONE;
   return 0;
 }
+
 
 /* Set *INUM to the inode number of the file that SET, read from the
    directory DP, describes.  Return EIO if the volume's directories
@@ -86,6 +97,7 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
   error_t err;
   bool spec_dotdot = l_flags & SPEC_DOTDOT;
   enum lookup_type type = l_flags & ~SPEC_DOTDOT;
+  bool entering = type == CREATE || type == RENAME;
   struct disknode *dn = dp->dn;
   struct node *np = NULL;
   struct exfat_location where;
@@ -94,9 +106,12 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
   struct exfat_set *set;
   char utf8[EXFAT_UTF8_NAME_MAX + 1];
   bool found = false;
+  ino_t inum = 0;
 
   if (npp)
     *npp = NULL;
+  if (ds)
+    diskfs_null_dirstat (ds);
 
   if (strcmp (name, ".") == 0)
     {
@@ -105,6 +120,8 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
 	  diskfs_nref (dp);
 	  *npp = dp;
 	}
+      if (ds)
+	ds->kind = DS_DOT;
       return 0;
     }
 
@@ -114,6 +131,8 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
 	return EAGAIN;
       if (!exfat_inode_location (dp->cache_id, &where))
 	return ENOENT;
+      if (ds)
+	ds->kind = DS_DOTDOT;
       if (!npp)
 	return 0;
 
@@ -142,7 +161,7 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
   if (strlen (name) > EXFAT_LISTED_NAME_MAX)
     return ENAMETOOLONG;
   if (!exfat_name_key (name, &key))
-    return ENOENT;
+    return entering ? EINVAL : ENOENT;
 
   set = malloc (sizeof *set);
   if (!set)
@@ -157,9 +176,6 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
   while (!(err = exfat_dir_next_set (&dir, set, &found)) && found)
     if (exfat_name_match (set, &key))
       break;
-  pthread_rwlock_unlock (&exfat_entry_lock);
-  exfat_dir_close (&dir);
-
   if (!err && !found)
     err = ENOENT;
   if (!err && !listable_name (set, utf8))
@@ -168,38 +184,168 @@ diskfs_lookup_hard (struct node *dp, const char *name, lookup_flags_t l_flags,
     err = ENAMETOOLONG;
   if (!err)
     err = set->error;
-  if (!err && npp)
-    {
-      ino_t inum;
+  if (!err)
+    err = set_inode (dp, set, &inum);
+  pthread_rwlock_unlock (&exfat_entry_lock);
+  exfat_dir_close (&dir);
 
-      err = set_inode (dp, set, &inum);
-      if (!err)
-	err = diskfs_cached_lookup (inum, &np);
-      if (!err)
-	*npp = np;
+  if (err == ENOENT && entering && !exfat_name_creatable (&key))
+    err = EINVAL;
+  else if (!err)
+    {
+      if (ds)
+	{
+	  ds->kind = DS_SET;
+	  ds->set_offset = set->offset;
+	  ds->ino = inum;
+	}
+      if (npp)
+	{
+	  err = diskfs_cached_lookup (inum, &np);
+	  if (!err)
+	    *npp = np;
+	}
     }
 
   free (set);
   return err;
 }
 
+/* Note that the entries of DP changed.  */
+static void
+directory_changed (struct node *dp)
+{
+  /* A name that was looked up and not found may be there now, under
+     another case as well.  The cache keeps such names as entries for
+     node zero.  */
+  static struct node none;
+
+  diskfs_purge_lookup_cache (dp, &none);
+  dp->dn->readdir_index = 0;
+  dp->dn->readdir_pos = 0;
+  dp->dn->readdir_hidden = 0;
+  dp->dn_set_mtime = 1;
+  dp->dn_set_ctime = 1;
+}
+
+/* Find unused entries of DP for SET to go in, growing DP if it has
+   none, and set *WHERE to where they are.  */
+static error_t
+place_set (struct node *dp, const struct exfat_set *set,
+	   struct exfat_location *where)
+{
+  error_t err;
+  struct exfat_dir dir;
+  off_t pos, run;
+
+  for (;;)
+    {
+      err = exfat_dir_open (&dir, &dp->dn->stream, dp == diskfs_root_node);
+      if (err)
+	return err;
+      pthread_rwlock_rdlock (&exfat_entry_lock);
+      err = exfat_dir_find_free (&dir, set->count, &pos);
+      pthread_rwlock_unlock (&exfat_entry_lock);
+      exfat_dir_close (&dir);
+      if (err != ENOSPC)
+	break;
+      if (dp->allocsize + CLUSTER_SIZE > EXFAT_DIR_SIZE_MAX)
+	return ENOSPC;
+      err = exfat_node_grow (dp, dp->allocsize + CLUSTER_SIZE);
+      if (err)
+	return err;
+    }
+  if (!err)
+    err = exfat_stream_map (&dp->dn->stream, pos, &where->set_offset, &run);
+  if (err)
+    return err;
+  where->parent = dp->cache_id;
+  where->parent_contiguous = dp->dn->stream.contiguous;
+  return 0;
+}
+
+/* Implement the diskfs_direnter_hard callback as described in
+   <hurd/diskfs.h>.  NP gets its entry set here.  A file that has one
+   already has its one name.  */
 error_t
 diskfs_direnter_hard (struct node *dp, const char *name, struct node *np,
 		      struct dirstat *ds, struct protid *cred)
 {
-  return EROFS;
+  error_t err;
+  struct exfat_name_key key;
+  struct exfat_location old, new;
+  struct exfat_meta meta;
+  struct exfat_set *set;
+
+  ds->kind = DS_NONE;
+  if (!exfat_name_key (name, &key) || !exfat_name_creatable (&key))
+    return EINVAL;
+  if (!exfat_inode_location (np->cache_id, &old))
+    return ESTALE;
+  if (old.set_offset)
+    return EOPNOTSUPP;
+
+  set = malloc (sizeof *set);
+  if (!set)
+    return ENOMEM;
+  exfat_node_meta (np, &meta);
+  exfat_set_create (set, &key, &meta);
+  err = place_set (dp, set, &new);
+  if (!err)
+    {
+      pthread_rwlock_wrlock (&exfat_entry_lock);
+      err = exfat_set_write_at (new.set_offset, new.parent_contiguous, set,
+				true);
+      if (!err)
+	exfat_inode_move (np->cache_id, &new);
+      pthread_rwlock_unlock (&exfat_entry_lock);
+    }
+  free (set);
+
+  if (!err)
+    directory_changed (dp);
+  return err;
 }
 
+/* Implement the diskfs_dirremove_hard callback as described in
+   <hurd/diskfs.h>.  The clusters of the file are freed when its node
+   goes; until then, or if the translator dies first, they stay
+   allocated with no file that has them.  */
 error_t
 diskfs_dirremove_hard (struct node *dp, struct dirstat *ds)
 {
-  return EROFS;
+  error_t err = 0;
+
+  switch (ds->kind)
+    {
+    case DS_DOT:
+    case DS_DOTDOT:
+      /* The volume does not record these.  */
+      break;
+
+    case DS_SET:
+      pthread_rwlock_wrlock (&exfat_entry_lock);
+      err = exfat_set_delete_at (ds->set_offset, dp->dn->stream.contiguous);
+      if (!err)
+	exfat_inode_detach (ds->ino);
+      pthread_rwlock_unlock (&exfat_entry_lock);
+      if (!err)
+	directory_changed (dp);
+      break;
+
+    default:
+      err = EINVAL;
+    }
+  ds->kind = DS_NONE;
+  return err;
 }
 
+/* A name cannot be given to another file yet.  */
 error_t
 diskfs_dirrewrite_hard (struct node *dp, struct node *np, struct dirstat *ds)
 {
-  return EROFS;
+  ds->kind = DS_NONE;
+  return EOPNOTSUPP;
 }
 
 /* Read the next entry set of DIR that can be opened.  */

@@ -276,6 +276,13 @@ struct disknode
   int readdir_hidden;
 };
 
+/* Given to diskfs_cached_lookup_context for a node that is not on the
+   volume yet.  */
+struct lookup_context
+{
+  mode_t mode;
+};
+
 struct user_pager_info
 {
   struct node *node;
@@ -383,6 +390,7 @@ void exfat_inode_forget (ino_t ino);
 void refresh_node_stats (void);
 error_t exfat_node_grow (struct node *np, off_t size);
 error_t exfat_node_write_set (struct node *np, off_t data_length);
+void exfat_node_meta (struct node *np, struct exfat_meta *meta);
 void exfat_write_all_nodes (void);
 
 /* pager.c */
