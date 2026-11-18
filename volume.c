@@ -565,6 +565,24 @@ load_upcase_table (cluster_t first, uint64_t length, uint32_t checksum)
       }
 }
 
+/* Return whether the bitmap has every cluster of the FAT chain that
+   starts at FIRST and holds LENGTH bytes, which can be read, as
+   allocated.  */
+static bool
+chain_allocated (cluster_t first, off_t length)
+{
+  struct exfat_stream stream;
+  bool all;
+
+  exfat_stream_init (&stream, first, false, length);
+  all = !exfat_stream_check (&stream);
+  for (size_t i = 0; all && i < stream.extent_count; i++)
+    all = exfat_clusters_allocated (stream.extents[i].start,
+				    stream.extents[i].count);
+  exfat_stream_fini (&stream);
+  return all;
+}
+
 /* Find the allocation bitmap and the up-case table in the root
    directory and load what the read path needs from them.  */
 static void
@@ -646,6 +664,18 @@ load_system_tables (void)
   err = exfat_bitmap_load (bitmap_cluster, bitmap_length);
   if (err)
     error (1, err, "%s: reading the allocation bitmap", diskfs_disk_name);
+
+  /* A cluster that the bitmap says is free goes to the next file
+     written.  */
+  if (!chain_allocated (vol.root_cluster,
+			(off_t) root_clusters << vol.cluster_shift))
+    only_read ("the allocation bitmap has clusters of the root directory"
+	       " as free");
+  else if (!chain_allocated (bitmap_cluster, bitmap_length))
+    only_read ("the allocation bitmap has clusters of its own as free");
+  else if (!chain_allocated (upcase_cluster, upcase_length))
+    only_read ("the allocation bitmap has clusters of the up-case table"
+	       " as free");
 }
 
 /* Validate the volume on STORE and load its parameters, or exit with a

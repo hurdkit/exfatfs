@@ -359,6 +359,7 @@ error_t exfat_bitmap_reload (void);
 error_t exfat_clusters_alloc (cluster_t hint, cluster_t want,
 			      cluster_t *start, cluster_t *count);
 error_t exfat_clusters_free (cluster_t start, cluster_t count);
+bool exfat_clusters_allocated (cluster_t start, cluster_t count);
 uint64_t exfat_free_generation (void);
 error_t exfat_clusters_free_unchanged (const struct exfat_extent *extents,
 				       size_t count, uint64_t *generation);

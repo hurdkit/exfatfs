@@ -186,6 +186,20 @@ exfat_clusters_free (cluster_t start, cluster_t count)
   return err;
 }
 
+/* Return whether the COUNT clusters from START are all allocated.  */
+bool
+exfat_clusters_allocated (cluster_t start, cluster_t count)
+{
+  bool all = cluster_valid (start)
+    && count <= vol.cluster_count - (start - EXFAT_FIRST_CLUSTER);
+
+  pthread_mutex_lock (&bitmap_lock);
+  for (cluster_t n = 0; all && n < count; n++)
+    all = allocated (start - EXFAT_FIRST_CLUSTER + n);
+  pthread_mutex_unlock (&bitmap_lock);
+  return all;
+}
+
 uint64_t
 exfat_free_generation (void)
 {
