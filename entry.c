@@ -1095,7 +1095,7 @@ exfat_dir_find_free (struct exfat_dir *dir, unsigned count, off_t *pos)
 	return err;
       if (e[0] == 0)
 	{
-	  /* Section 6.1: every entry from here on is unused as well.  */
+	  /* Section 6.2.1: every entry from here on is unused as well.  */
 	  off_t start = at - run * EXFAT_ENTRY_SIZE;
 
 	  if ((dir->stream->length - start) / EXFAT_ENTRY_SIZE < count)

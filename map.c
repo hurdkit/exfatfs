@@ -423,7 +423,7 @@ exfat_stream_grow (struct exfat_stream *stream, cluster_t clusters, bool zero)
 	err = exfat_fat_set_run (runs[i].start, runs[i].count,
 				 i + 1 < run_count
 				 ? runs[i + 1].start : EXFAT_EOC);
-      /* Section 7.6.2.4: once NoFatChain is clear, the FAT has to
+      /* Section 6.3.4.2: once NoFatChain is clear, the FAT has to
 	 describe the clusters the stream already had as well.  */
       if (!err && have && stream->contiguous)
 	err = exfat_fat_set_run (stream->first_cluster, have, runs[0].start);

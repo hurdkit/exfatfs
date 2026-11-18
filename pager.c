@@ -108,8 +108,9 @@ pager_write_page (struct user_pager_info *pager, vm_offset_t page,
   if ((off_t) page < end)
     {
       pthread_mutex_lock (&dn->valid_lock);
-      /* Section 7.6.5.1: what lies between ValidDataLength and the
-	 data written past it is to hold zeros.  */
+      /* Section 7.6.5: what the disk holds past ValidDataLength is
+	 undefined, and moving ValidDataLength past it makes it part
+	 of the file, which reads as zeros there.  */
       if (dn->valid_length < (off_t) page)
 	err = exfat_stream_zero (&dn->stream, dn->valid_length,
 				 page - dn->valid_length);

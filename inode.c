@@ -276,8 +276,8 @@ diskfs_set_statfs (struct statfs *st)
    The allocation it records is the clusters of NP that DATA_LENGTH
    takes.  NP has more than those between diskfs_grow and the write
    that asked for them, and on the volume they belong to no file until
-   the size says that the file has them: section 7.6.5 has DataLength
-   be the size of the file, and what its allocation holds.  */
+   the size says that the file has them: sections 6.2.3 and 7.6.7 have
+   DataLength be the size of the file, and what its allocation holds.  */
 static void
 node_meta (struct node *np, off_t data_length, struct exfat_meta *meta)
 {

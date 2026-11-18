@@ -631,7 +631,7 @@ exfat_mount (void)
 
   if (vol.fat_count != 1 && !diskfs_hard_readonly)
     {
-      /* Section 3.1.9: a second FAT belongs to TexFAT, whose rules for
+      /* Section 3.1.16: a second FAT belongs to TexFAT, whose rules for
 	 keeping the two in step are not implemented here.  */
       error (0, 0, "%s: the volume has two FATs; it can only be read",
 	     diskfs_disk_name);
