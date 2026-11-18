@@ -27,7 +27,6 @@
 
 struct exfat_volume vol;
 uint16_t *exfat_upcase;
-cluster_t exfat_free_clusters;
 
 #define refuse(fmt, ...) \
   error (1, 0, "%s: " fmt, diskfs_disk_name, ##__VA_ARGS__)
@@ -413,47 +412,6 @@ load_upcase_table (cluster_t first, uint64_t length, uint32_t checksum)
   free (data);
 }
 
-static void
-count_free_clusters (cluster_t first, uint64_t length)
-{
-  enum { WINDOW = 1 << 16 };
-  error_t err = 0;
-  struct exfat_stream stream;
-  uint8_t *window;
-  off_t bytes = ((off_t) vol.cluster_count + 7) / 8;
-  cluster_t used = 0;
-
-  if (length < (uint64_t) bytes
-      || !exfat_allocation_valid (first, false, length))
-    refuse ("the allocation bitmap's allocation is invalid");
-  window = malloc (WINDOW);
-  if (!window)
-    error (1, ENOMEM, "allocation bitmap");
-  exfat_stream_init (&stream, first, false, length);
-
-  for (off_t start = 0; !err && start < bytes; start += WINDOW)
-    {
-      size_t len = bytes - start < WINDOW ? bytes - start : WINDOW;
-      size_t rounded = (len + SECTOR_SIZE - 1) & ~(SECTOR_SIZE - 1);
-
-      err = exfat_stream_read (&stream, start, window, rounded);
-      for (size_t i = 0; !err && i < len; i++)
-	{
-	  unsigned bits = window[i];
-
-	  if ((start + i) * 8 + 8 > vol.cluster_count)
-	    bits &= (1U << (vol.cluster_count - (start + i) * 8)) - 1;
-	  used += __builtin_popcount (bits);
-	}
-    }
-  if (err)
-    error (1, err, "%s: reading the allocation bitmap", diskfs_disk_name);
-
-  exfat_free_clusters = vol.cluster_count - used;
-  exfat_stream_fini (&stream);
-  free (window);
-}
-
 /* Find the allocation bitmap and the up-case table in the root
    directory and load what the read path needs from them.  */
 static void
@@ -529,7 +487,12 @@ load_system_tables (void)
     refuse ("the root directory has no up-case table");
 
   load_upcase_table (upcase_cluster, upcase_length, upcase_checksum);
-  count_free_clusters (bitmap_cluster, bitmap_length);
+  if (bitmap_length < ((uint64_t) vol.cluster_count + 7) / 8
+      || !exfat_allocation_valid (bitmap_cluster, false, bitmap_length))
+    refuse ("the allocation bitmap's allocation is invalid");
+  err = exfat_bitmap_load (bitmap_cluster, bitmap_length);
+  if (err)
+    error (1, err, "%s: reading the allocation bitmap", diskfs_disk_name);
 }
 
 /* Validate the volume on STORE and load its parameters, or exit with a

@@ -246,3 +246,29 @@ exfat_stream_read (struct exfat_stream *stream, off_t offset,
     }
   return 0;
 }
+
+/* Write LEN bytes from BUF at OFFSET of STREAM, under the conditions of
+   exfat_stream_read.  */
+error_t
+exfat_stream_write (struct exfat_stream *stream, off_t offset,
+		    const void *buf, size_t len)
+{
+  while (len > 0)
+    {
+      error_t err;
+      off_t disk_offset, run;
+      size_t chunk;
+
+      err = exfat_stream_map (stream, offset, &disk_offset, &run);
+      if (err)
+	return err;
+      chunk = run < (off_t) len ? (size_t) run : len;
+      err = exfat_disk_write (disk_offset, buf, chunk);
+      if (err)
+	return err;
+      offset += chunk;
+      buf = (const char *) buf + chunk;
+      len -= chunk;
+    }
+  return 0;
+}

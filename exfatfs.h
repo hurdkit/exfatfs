@@ -273,6 +273,13 @@ error_t exfat_store_flush (void);
 error_t exfat_volume_mark (bool in_use);
 error_t exfat_fat_next (cluster_t cluster, cluster_t *next);
 
+/* alloc.c */
+error_t exfat_bitmap_load (cluster_t first, uint64_t length);
+error_t exfat_bitmap_reload (void);
+error_t exfat_clusters_alloc (cluster_t hint, cluster_t want,
+			      cluster_t *start, cluster_t *count);
+error_t exfat_clusters_free (cluster_t start, cluster_t count);
+
 /* map.c */
 bool exfat_allocation_valid (cluster_t first, bool contiguous, uint64_t length);
 error_t exfat_chain_length (cluster_t first, cluster_t *count);
@@ -286,6 +293,8 @@ error_t exfat_stream_map (struct exfat_stream *stream, off_t offset,
 error_t exfat_stream_check (struct exfat_stream *stream);
 error_t exfat_stream_read (struct exfat_stream *stream, off_t offset,
 			   void *buf, size_t len);
+error_t exfat_stream_write (struct exfat_stream *stream, off_t offset,
+			    const void *buf, size_t len);
 
 /* entry.c */
 error_t exfat_dir_open (struct exfat_dir *dir, struct exfat_stream *stream,
