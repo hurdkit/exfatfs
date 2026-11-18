@@ -646,12 +646,12 @@ diskfs_truncate (struct node *node, loff_t length)
       diskfs_set_node_times (node);
       err = exfat_node_write_set (node, directory ? allocated : st->st_size);
       if (!err)
-	err = exfat_stream_shrink (&dn->stream, clusters);
-      if (!err)
 	{
+	  /* What a failed shrink freed is freed all the same.  */
+	  err = exfat_stream_shrink (&dn->stream, clusters);
 	  node->allocsize = dn->stream.length;
 	  st->st_blocks = node->allocsize >> 9;
-	  if (directory && !clusters)
+	  if (directory && !node->allocsize)
 	    exfat_inode_set_dir_cluster (node->cache_id, 0);
 	}
     }

@@ -457,6 +457,7 @@ exfat_stream_shrink (struct exfat_stream *stream, cluster_t clusters)
 {
   error_t err = 0;
   cluster_t have;
+  bool shrunk = false;
 
   pthread_mutex_lock (&stream->lock);
   have = round_cluster (stream->length) >> vol.cluster_shift;
@@ -467,8 +468,13 @@ exfat_stream_shrink (struct exfat_stream *stream, cluster_t clusters)
     }
 
   if (stream->contiguous)
-    err = exfat_clusters_free (stream->first_cluster + clusters,
-			       have - clusters);
+    {
+      /* The clusters are free here even if writing the bitmap failed,
+	 and may be another file's from now on.  */
+      err = exfat_clusters_free (stream->first_cluster + clusters,
+				 have - clusters);
+      shrunk = true;
+    }
   else
     {
       cluster_t last;
@@ -502,10 +508,11 @@ exfat_stream_shrink (struct exfat_stream *stream, cluster_t clusters)
 	    }
 	  stream->extent_count = kept;
 	  stream->mapped = clusters;
+	  shrunk = true;
 	}
     }
 
-  if (!err)
+  if (shrunk)
     {
       stream->length = (off_t) clusters << vol.cluster_shift;
       if (!clusters)
