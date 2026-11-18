@@ -19,6 +19,7 @@
    Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111, USA. */
 
 #include <stdlib.h>
+#include <error.h>
 #include <string.h>
 #include <time.h>
 #include <assert-backtrace.h>
@@ -697,57 +698,69 @@ exfat_set_changes_apply (struct exfat_set_change *const *changes,
   return err;
 }
 
-/* Add to ALLOCS and KNOWN the allocations that the entries of the
-   COUNT entries in RAW name, a set that is removed, other than those
-   of the Stream Extension of a file, and return how many there are.
-   KNOWN says whether each is of a kind that section 8.2 has freed with
-   the set: the benign primary entry of a set that a removed directory
-   held, and benign secondary entries other than Vendor Extension
-   entries, whose bytes past the flags are the vendor's (section 7.8).
-   Nothing that a set with a wrong checksum names is.  */
-static unsigned
-set_allocations (const uint8_t *raw, unsigned count,
-		 struct exfat_alloc *allocs, bool *known)
+/* Section 8.2 has the allocations of the unrecognized benign
+   secondary entries of a set freed when the set is deleted, and those
+   of the unrecognized benign primary entries in a directory when the
+   directory is deleted.  The Linux driver frees them.  Here they are
+   left allocated instead.  Only the entry says that the clusters are
+   its own, and on a damaged or crafted volume that fsck.exfat finds
+   nothing wrong with they are another file's, or the allocation
+   bitmap's: freeing them hands that file's clusters to the next one
+   written.  Telling the two apart takes a walk of every directory on
+   the volume and every node that also keeps out what is allocated
+   while it goes on; the walk this translator had did not, and a file
+   that grew meanwhile lost its end.  Leaving them loses nothing.
+   Marking the volume dirty would not get them back: fsck.exfat neither
+   reports nor frees clusters that no entry names.  Such entries are
+   rare, and the first time this happens it says so.  */
+static void
+left_allocated (uint64_t clusters)
+{
+  static bool told;
+
+  if (clusters && !__atomic_exchange_n (&told, true, __ATOMIC_RELAXED))
+    error (0, 0, "%s: did not free what a removed directory entry of a kind"
+	   " not known here named (%llu clusters), since it may be another"
+	   " file's", diskfs_disk_name, (unsigned long long) clusters);
+}
+
+/* Return how many clusters the entries of the COUNT entries in RAW, a
+   set that is removed, name that section 8.2 has freed with it: those
+   of benign entries other than the Stream Extension and File Name
+   entries of a file, and other than Vendor Extension entries, whose
+   bytes past the flags are the vendor's (section 7.8).  */
+static uint64_t
+unknown_clusters (const uint8_t *raw, unsigned count)
 {
   bool file = raw[0] == EXFAT_TYPE_FILE;
-  bool sealed = checksum16 (checksum16 (0, raw, 2), raw + 4,
-			    count * EXFAT_ENTRY_SIZE - 4) == get_le16 (raw + 2);
-  unsigned n = 0;
+  uint64_t clusters = 0;
 
   for (unsigned i = file ? 1 : 0; i < count; i++)
     {
       const uint8_t *entry = raw + i * EXFAT_ENTRY_SIZE;
       unsigned flags = i == 0 ? get_le16 (entry + 4) : entry[1];
+      cluster_t first = get_le32 (entry + 20);
+      uint64_t length = get_le64 (entry + 24);
 
-      if (file && (entry[0] == EXFAT_TYPE_STREAM
-		   || entry[0] == EXFAT_TYPE_NAME))
+      if ((file && (entry[0] == EXFAT_TYPE_STREAM
+		    || entry[0] == EXFAT_TYPE_NAME))
+	  || !(entry[0] & EXFAT_TYPE_BENIGN)
+	  || entry[0] == EXFAT_TYPE_VENDOR_EXTENSION)
 	continue;
-      /* AllocationPossible.  */
-      if (!(flags & 1) || get_le32 (entry + 20) == 0
-	  || get_le64 (entry + 24) == 0)
-	continue;
-      allocs[n] = (struct exfat_alloc) { get_le32 (entry + 20), flags & 2,
-					 get_le64 (entry + 24) };
-      known[n++] = sealed && (entry[0] & EXFAT_TYPE_BENIGN)
-	&& entry[0] != EXFAT_TYPE_VENDOR_EXTENSION;
+      /* AllocationPossible, and NoFatChain.  */
+      if ((flags & 1) && first != 0 && length != 0
+	  && exfat_allocation_valid (first, flags & 2, length))
+	clusters += round_cluster (length) >> vol.cluster_shift;
     }
-  return n;
+  return clusters;
 }
 
-/* Section 8.2: deleting a set frees the allocations of the entries in
-   it that are not known here, such as Vendor Allocation entries.  Free
-   those of the COUNT entries in RAW, a set that was deleted, where
-   exfat_free_unknown finds them to be the set's own.  The caller holds
-   no lock on directory entries.  */
+/* Leave allocated what the COUNT entries in RAW, a set that was
+   deleted, name that section 8.2 has freed with it.  */
 void
-exfat_set_free_unknown (const uint8_t *raw, unsigned count)
+exfat_set_keep_unknown (const uint8_t *raw, unsigned count)
 {
-  struct exfat_alloc allocs[EXFAT_SET_MAX];
-  bool known[EXFAT_SET_MAX];
-  unsigned n = set_allocations (raw, count, allocs, known);
-
-  if (n)
-    exfat_free_unknown (allocs, known, n);
+  left_allocated (unknown_clusters (raw, count));
 }
 
 /* Mark the entries of the set whose File entry is at OFFSET as no
@@ -1042,16 +1055,13 @@ exfat_dir_next_set (struct exfat_dir *dir, struct exfat_set *set,
     }
 }
 
-/* Free what the sets in DIR that have a benign primary entry hold,
-   for a directory that is deleted, where exfat_free_unknown finds it
-   to be theirs.  */
+/* Leave allocated what the sets in DIR that have a benign primary
+   entry name, for a directory that is deleted.  */
 void
-exfat_dir_free_benign (struct exfat_dir *dir)
+exfat_dir_keep_benign (struct exfat_dir *dir)
 {
   uint8_t *raw = malloc (EXFAT_SET_MAX * EXFAT_ENTRY_SIZE);
-  struct exfat_alloc *allocs = NULL;
-  bool *known = NULL;
-  unsigned found = 0;
+  uint64_t clusters = 0;
   const uint8_t *entry;
 
   if (!raw)
@@ -1076,26 +1086,11 @@ exfat_dir_free_benign (struct exfat_dir *dir)
 	  memcpy (raw + n * EXFAT_ENTRY_SIZE, entry, EXFAT_ENTRY_SIZE);
 	}
       if (n == count)
-	{
-	  struct exfat_alloc *a = realloc (allocs, (found + count) * sizeof *a);
-	  bool *k = a ? realloc (known, (found + count) * sizeof *k) : NULL;
-
-	  if (a)
-	    allocs = a;
-	  if (k)
-	    known = k;
-	  if (!k)
-	    break;
-	  found += set_allocations (raw, count, allocs + found,
-				    known + found);
-	}
+	clusters += unknown_clusters (raw, count);
       dir->pos += n * EXFAT_ENTRY_SIZE;
     }
-  if (found)
-    exfat_free_unknown (allocs, known, found);
-  free (allocs);
-  free (known);
   free (raw);
+  left_allocated (clusters);
 }
 
 /* Find COUNT unused entries that follow one another in DIR, and set

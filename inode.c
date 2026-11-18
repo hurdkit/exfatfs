@@ -28,9 +28,6 @@
 
 pthread_rwlock_t exfat_entry_lock = PTHREAD_RWLOCK_INITIALIZER;
 
-static struct disknode *all_nodes;
-static pthread_mutex_t all_nodes_lock = PTHREAD_MUTEX_INITIALIZER;
-
 /* The user must define this function if she wants to use the node
    cache.  Create and initialize a node.  */
 error_t
@@ -44,33 +41,8 @@ diskfs_user_make_node (struct node **npp, struct lookup_context *ctx)
   exfat_stream_init (&np->dn->stream, 0, false, 0);
   pthread_rwlock_init (&np->dn->alloc_lock, NULL);
   pthread_mutex_init (&np->dn->valid_lock, NULL);
-
-  pthread_mutex_lock (&all_nodes_lock);
-  np->dn->next_node = all_nodes;
-  if (all_nodes)
-    all_nodes->prev_node = &np->dn->next_node;
-  np->dn->prev_node = &all_nodes;
-  all_nodes = np->dn;
-  pthread_mutex_unlock (&all_nodes_lock);
-
   *npp = np;
   return 0;
-}
-
-/* Set *MEETS to whether the allocation of any node has one of the
-   COUNT clusters from START.  */
-error_t
-exfat_nodes_meet (cluster_t start, cluster_t count, bool *meets)
-{
-  error_t err = 0;
-
-  *meets = false;
-  pthread_mutex_lock (&all_nodes_lock);
-  for (struct disknode *dn = all_nodes; dn && !err && !*meets;
-       dn = dn->next_node)
-    err = exfat_stream_meets (&dn->stream, start, count, meets);
-  pthread_mutex_unlock (&all_nodes_lock);
-  return err;
 }
 
 /* Return the number of directories in the directory NP.  The volume
@@ -215,13 +187,6 @@ diskfs_node_norefs (struct node *np)
 {
   assert_backtrace (!np->dn->pager);
   exfat_rename_forget (np->cache_id);
-
-  pthread_mutex_lock (&all_nodes_lock);
-  *np->dn->prev_node = np->dn->next_node;
-  if (np->dn->next_node)
-    np->dn->next_node->prev_node = np->dn->prev_node;
-  pthread_mutex_unlock (&all_nodes_lock);
-
   exfat_stream_fini (&np->dn->stream);
   pthread_rwlock_destroy (&np->dn->alloc_lock);
   pthread_mutex_destroy (&np->dn->valid_lock);
@@ -643,7 +608,7 @@ diskfs_truncate (struct node *node, loff_t length)
 	{
 	  /* The directory is being deleted, and nothing can reach it
 	     any more to change its entries.  */
-	  exfat_dir_free_benign (&dir);
+	  exfat_dir_keep_benign (&dir);
 	  exfat_dir_close (&dir);
 	}
 

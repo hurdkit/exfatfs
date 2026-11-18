@@ -19,7 +19,7 @@ makemode := server
 
 target = exfatfs
 SRCS = main.c volume.c alloc.c map.c entry.c dir.c inode.c vinode.c \
-       pager.c unknown.c
+       pager.c
 
 OBJS = $(SRCS:.c=.o)
 HURDLIBS = diskfs iohelp fshelp store pager ports ihash shouldbeinlibc

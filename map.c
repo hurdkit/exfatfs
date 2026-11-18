@@ -524,33 +524,3 @@ exfat_stream_shrink (struct exfat_stream *stream, cluster_t clusters)
   pthread_mutex_unlock (&stream->lock);
   return err;
 }
-
-/* Set *MEETS to whether any of the COUNT clusters from START is part of
-   the allocation of STREAM.  */
-error_t
-exfat_stream_meets (struct exfat_stream *stream, cluster_t start,
-		    cluster_t count, bool *meets)
-{
-  error_t err = 0;
-  uint64_t end = (uint64_t) start + count;
-  cluster_t clusters;
-
-  *meets = false;
-  pthread_mutex_lock (&stream->lock);
-  clusters = round_cluster (stream->length) >> vol.cluster_shift;
-  if (clusters && stream->contiguous)
-    *meets = stream->first_cluster < end
-      && start < (uint64_t) stream->first_cluster + clusters;
-  else if (clusters)
-    {
-      err = extend_chain (stream, clusters - 1);
-      for (size_t i = 0; !err && !*meets && i < stream->extent_count; i++)
-	{
-	  const struct exfat_extent *e = &stream->extents[i];
-
-	  *meets = e->start < end && start < (uint64_t) e->start + e->count;
-	}
-    }
-  pthread_mutex_unlock (&stream->lock);
-  return err;
-}

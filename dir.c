@@ -560,9 +560,9 @@ enter_set (struct node *dp, struct node *np, const struct exfat_name_key *key,
       if (err && renaming)
 	exfat_rename_forget (np->cache_id);
       if (!err && target_offset)
-	/* The set that had the name is gone, and what it held of its
-	   own with it.  */
-	exfat_set_free_unknown (w->target.before, w->target.count);
+	/* The set that had the name is gone; what its unknown entries
+	   named stays allocated.  */
+	exfat_set_keep_unknown (w->target.before, w->target.count);
     }
   free (w);
 
@@ -637,7 +637,7 @@ diskfs_dirremove_hard (struct node *dp, struct dirstat *ds)
       pthread_rwlock_unlock (&exfat_entry_lock);
       if (!err)
 	{
-	  exfat_set_free_unknown (raw, count);
+	  exfat_set_keep_unknown (raw, count);
 	  directory_changed (dp);
 	}
       free (raw);
