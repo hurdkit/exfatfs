@@ -57,6 +57,7 @@ typedef uint32_t cluster_t;
 
 #define EXFAT_ATTR_READONLY	0x01
 #define EXFAT_ATTR_DIRECTORY	0x10
+#define EXFAT_ATTR_ARCHIVE	0x20
 
 /* The inode number of the root directory.  The other files are
    numbered from the next one up.  */
@@ -198,6 +199,19 @@ struct exfat_set
   struct timespec access_time;
 };
 
+/* What the entry set of a file says about it, apart from its name.  */
+struct exfat_meta
+{
+  uint16_t attributes;
+  cluster_t first_cluster;
+  bool contiguous;
+  off_t data_length;
+  off_t valid_length;
+  struct timespec create_time;
+  struct timespec modify_time;
+  struct timespec access_time;
+};
+
 /* A position in a directory.  */
 struct exfat_dir
 {
@@ -210,9 +224,11 @@ struct exfat_dir
   size_t window_length;
 };
 
-/* A name prepared for comparison with the names in a directory.  */
+/* A name in UTF-16, as it is and prepared for comparison with the
+   names in a directory.  */
 struct exfat_name_key
 {
+  uint16_t name[EXFAT_NAME_MAX];
   uint16_t upcased[EXFAT_NAME_MAX];
   unsigned length;
   uint16_t hash;
@@ -315,7 +331,23 @@ error_t exfat_dir_next_set (struct exfat_dir *dir, struct exfat_set *set,
 			    bool *found);
 error_t exfat_set_read_at (off_t offset, bool contiguous,
 			   struct exfat_set *set);
+error_t exfat_dir_find_free (struct exfat_dir *dir, unsigned count,
+			     off_t *pos);
+error_t exfat_set_write_at (off_t offset, bool contiguous,
+			    const struct exfat_set *set, bool creating);
+error_t exfat_set_delete_at (off_t offset, bool contiguous);
+void exfat_set_create (struct exfat_set *set,
+		       const struct exfat_name_key *name,
+		       const struct exfat_meta *meta);
+void exfat_set_update (struct exfat_set *set, const struct exfat_meta *meta);
+error_t exfat_set_rename (struct exfat_set *set,
+			  const struct exfat_name_key *name);
 bool exfat_name_key (const char *name, struct exfat_name_key *key);
+void exfat_name_key_of_set (const struct exfat_set *set,
+			    struct exfat_name_key *key);
+bool exfat_name_creatable (const struct exfat_name_key *key);
+bool exfat_name_exact (const struct exfat_set *set,
+		       const struct exfat_name_key *key);
 bool exfat_name_match (const struct exfat_set *set,
 		       const struct exfat_name_key *key);
 size_t exfat_name_to_utf8 (const uint16_t *name, unsigned length, char *out);

@@ -138,6 +138,7 @@ exfat_name_key (const char *name, struct exfat_name_key *key)
 	{
 	  uint16_t up = exfat_upcase[units[i]];
 
+	  key->name[key->length] = units[i];
 	  key->upcased[key->length++] = up;
 	  bytes[0] = up & 0xff;
 	  bytes[1] = up >> 8;
@@ -145,6 +146,26 @@ exfat_name_key (const char *name, struct exfat_name_key *key)
 	}
     }
   return key->length > 0;
+}
+
+/* Set *KEY to the name of SET, which was read and found to have
+   one.  */
+void
+exfat_name_key_of_set (const struct exfat_set *set,
+		       struct exfat_name_key *key)
+{
+  uint8_t bytes[2];
+
+  key->length = set->name_length;
+  key->hash = 0;
+  for (unsigned i = 0; i < key->length; i++)
+    {
+      key->name[i] = set->name[i];
+      key->upcased[i] = exfat_upcase[set->name[i]];
+      bytes[0] = key->upcased[i] & 0xff;
+      bytes[1] = key->upcased[i] >> 8;
+      key->hash = checksum16 (key->hash, bytes, 2);
+    }
 }
 
 /* Return whether SET's name is KEY's, ignoring case.  */
@@ -159,6 +180,27 @@ exfat_name_match (const struct exfat_set *set,
     return false;
   for (unsigned i = 0; i < key->length; i++)
     if (exfat_upcase[set->name[i]] != key->upcased[i])
+      return false;
+  return true;
+}
+
+/* Return whether SET's name is KEY's, case and all.  */
+bool
+exfat_name_exact (const struct exfat_set *set,
+		  const struct exfat_name_key *key)
+{
+  return set->name_length == key->length
+    && memcmp (set->name, key->name, key->length * sizeof *key->name) == 0;
+}
+
+/* Return whether a file may be given the name in KEY.  Table 35 keeps
+   the control codes and these characters out of file names.  */
+bool
+exfat_name_creatable (const struct exfat_name_key *key)
+{
+  for (unsigned i = 0; i < key->length; i++)
+    if (key->name[i] < 0x20
+	|| (key->name[i] < 0x80 && strchr ("\"*/:<>?\\|", key->name[i])))
       return false;
   return true;
 }
@@ -201,6 +243,50 @@ decode_time (uint32_t stamp, uint8_t increment, uint8_t utc_offset)
       ts.tv_nsec = (increment % 100) * 10000000L;
     }
   return ts;
+}
+
+/* The stamp of the time TS, in UTC, and the count of 10 ms that goes
+   with it.  */
+static void
+encode_time (struct timespec ts, uint32_t *stamp, uint8_t *increment)
+{
+  /* What the seven bits of the year can hold: 1980 to 2107.  */
+  const time_t first = 315532800, last = 4354819199;
+  time_t sec = ts.tv_sec < first ? first : ts.tv_sec > last ? last : ts.tv_sec;
+  struct tm tm;
+
+  gmtime_r (&sec, &tm);
+  *stamp = (uint32_t) (tm.tm_year - 80) << 25 | (tm.tm_mon + 1) << 21
+    | tm.tm_mday << 16 | tm.tm_hour << 11 | tm.tm_min << 5 | tm.tm_sec / 2;
+  *increment = (tm.tm_sec & 1) * 100 + ts.tv_nsec / 10000000;
+}
+
+/* Record the time TS at STAMP, with its count of 10 ms at INCREMENT if
+   that is not null and its offset from UTC at UTC_OFFSET, unless what
+   is there already stands for the same time: a time written in local
+   time is another time to its writer once it is rewritten in UTC.  */
+static void
+put_time (struct timespec ts, uint8_t *stamp, uint8_t *increment,
+	  uint8_t *utc_offset)
+{
+  uint32_t value;
+  uint8_t tens;
+  struct timespec old, new;
+
+  encode_time (ts, &value, &tens);
+  if (!increment)
+    tens = 0;
+  old = decode_time (get_le32 (stamp), increment ? *increment : 0,
+		     *utc_offset);
+  new = decode_time (value, tens, 0x80);
+  if (old.tv_sec == new.tv_sec && old.tv_nsec == new.tv_nsec)
+    return;
+
+  put_le32 (stamp, value);
+  if (increment)
+    *increment = tens;
+  /* Section 7.4.10: the offset is valid, and zero.  */
+  *utc_offset = 0x80;
 }
 
 /* Validate the SET->count entries in SET->raw and fill in the rest of
@@ -350,6 +436,251 @@ exfat_set_read_at (off_t offset, bool contiguous, struct exfat_set *set)
   return parse_set (set);
 }
 
+/* Set AT[0] to AT[COUNT - 1] to the volume offsets of the COUNT
+   entries that start at OFFSET, in a directory that is CONTIGUOUS or
+   not.  */
+static error_t
+entry_positions (off_t offset, bool contiguous, unsigned count, off_t *at)
+{
+  if (offset < vol.heap_offset || offset % EXFAT_ENTRY_SIZE != 0
+      || !cluster_valid (EXFAT_FIRST_CLUSTER
+			 + ((offset - vol.heap_offset) >> vol.cluster_shift)))
+    return EIO;
+
+  for (unsigned i = 0; i < count; i++)
+    {
+      at[i] = offset;
+      offset += EXFAT_ENTRY_SIZE;
+      if (((offset - vol.heap_offset) & (CLUSTER_SIZE - 1)) == 0
+	  && i + 1 < count)
+	{
+	  cluster_t cluster = EXFAT_FIRST_CLUSTER
+	    + ((at[i] - vol.heap_offset) >> vol.cluster_shift);
+	  cluster_t next;
+
+	  if (contiguous)
+	    next = cluster + 1;
+	  else
+	    {
+	      error_t err = exfat_fat_next (cluster, &next);
+
+	      if (err)
+		return err;
+	    }
+	  if (!cluster_valid (next))
+	    return EIO;
+	  offset = cluster_offset (next);
+	}
+    }
+  return 0;
+}
+
+/* Read or write the COUNT entries in RAW at the volume offsets in AT.
+   Entries that follow one another on the disk go in one request, and
+   a piece that already holds what is to be written is not written.
+   With LAST_FIRST, the pieces are written from the last to the
+   first.  */
+static error_t
+transfer_entries (const off_t *at, uint8_t *raw, unsigned count, bool write,
+		  bool last_first)
+{
+  error_t err = 0;
+  uint8_t *buf = malloc (count * EXFAT_ENTRY_SIZE + 2 * SECTOR_SIZE);
+  unsigned done = 0;
+
+  if (!buf)
+    return ENOMEM;
+  while (!err && done < count)
+    {
+      unsigned first, last;
+      off_t start, end;
+      uint8_t *data;
+      size_t size;
+
+      if (last_first)
+	{
+	  last = count - 1 - done;
+	  for (first = last;
+	       first > 0 && at[first - 1] + EXFAT_ENTRY_SIZE == at[first];
+	       first--)
+	    ;
+	}
+      else
+	{
+	  first = done;
+	  for (last = first;
+	       last + 1 < count && at[last] + EXFAT_ENTRY_SIZE == at[last + 1];
+	       last++)
+	    ;
+	}
+
+      start = at[first] & ~(off_t) (SECTOR_SIZE - 1);
+      end = (at[last] + EXFAT_ENTRY_SIZE + SECTOR_SIZE - 1)
+	& ~(off_t) (SECTOR_SIZE - 1);
+      data = buf + (at[first] - start);
+      size = (last - first + 1) * EXFAT_ENTRY_SIZE;
+
+      err = exfat_disk_read (start, buf, end - start);
+      if (!err && !write)
+	memcpy (raw + first * EXFAT_ENTRY_SIZE, data, size);
+      else if (!err && memcmp (data, raw + first * EXFAT_ENTRY_SIZE, size))
+	{
+	  memcpy (data, raw + first * EXFAT_ENTRY_SIZE, size);
+	  err = exfat_disk_write (start, buf, end - start);
+	}
+      done += last - first + 1;
+    }
+  free (buf);
+  return err;
+}
+
+/* Write the entries of SET where exfat_set_read_at would read them
+   from.
+
+   A set that lies in one run of sectors is written with one request.
+   One that a cluster boundary splits takes two.  When CREATING, the
+   entries were unused before, and the piece that holds the File entry
+   is written last: until then the rest are secondary entries that no
+   set claims, which every reader skips.  A set that is being changed
+   has a wrong checksum if the translator dies between the two, when
+   the change is in both pieces; there is nothing to be done about
+   that without a journal.  */
+error_t
+exfat_set_write_at (off_t offset, bool contiguous,
+		    const struct exfat_set *set, bool creating)
+{
+  off_t at[EXFAT_SET_MAX];
+  error_t err = entry_positions (offset, contiguous, set->count, at);
+
+  if (err)
+    return err;
+  return transfer_entries (at, (uint8_t *) set->raw, set->count, true,
+			   creating);
+}
+
+/* Mark the entries of the set whose File entry is at OFFSET as no
+   longer in use.  The File entry goes first: without it the rest are
+   again secondary entries that no set claims.  */
+error_t
+exfat_set_delete_at (off_t offset, bool contiguous)
+{
+  error_t err;
+  off_t at[EXFAT_SET_MAX];
+  uint8_t *raw;
+  unsigned count = 1, n;
+
+  raw = malloc (EXFAT_SET_MAX * EXFAT_ENTRY_SIZE);
+  if (!raw)
+    return ENOMEM;
+  err = entry_positions (offset, contiguous, 1, at);
+  if (!err)
+    err = transfer_entries (at, raw, 1, false, false);
+  if (!err && raw[0] != EXFAT_TYPE_FILE)
+    err = EIO;
+  if (!err)
+    {
+      count = 1 + raw[1];
+      err = entry_positions (offset, contiguous, count, at);
+    }
+  if (!err)
+    err = transfer_entries (at, raw, count, false, false);
+  if (!err)
+    {
+      for (n = 1; n < count; n++)
+	if (!in_use_secondary (raw[n * EXFAT_ENTRY_SIZE]))
+	  break;
+      for (unsigned i = 0; i < n; i++)
+	raw[i * EXFAT_ENTRY_SIZE] &= ~EXFAT_TYPE_IN_USE;
+      err = transfer_entries (at, raw, n, true, false);
+    }
+  free (raw);
+  return err;
+}
+
+static void
+seal_set (struct exfat_set *set)
+{
+  uint8_t *file = set->raw;
+
+  file[1] = set->count - 1;
+  put_le16 (file + 2, checksum16 (checksum16 (0, file, 2), file + 4,
+				  set->count * EXFAT_ENTRY_SIZE - 4));
+}
+
+/* Make SET, which was read and found good, say what META says.  The
+   time of creation is left as it is.  */
+void
+exfat_set_update (struct exfat_set *set, const struct exfat_meta *meta)
+{
+  uint8_t *file = set->raw;
+  uint8_t *stream = set->raw + EXFAT_ENTRY_SIZE;
+
+  put_le16 (file + 4, meta->attributes);
+  put_time (meta->modify_time, file + 12, file + 21, file + 23);
+  put_time (meta->access_time, file + 16, NULL, file + 24);
+
+  /* AllocationPossible, and NoFatChain.  */
+  stream[1] = (stream[1] & ~3U) | 1 | (meta->contiguous ? 2 : 0);
+  put_le64 (stream + 8, meta->valid_length);
+  put_le32 (stream + 20, meta->first_cluster);
+  put_le64 (stream + 24, meta->data_length);
+  seal_set (set);
+}
+
+/* Give SET, which was read and found good, the name in NAME.  The
+   entries that follow those of its old name are kept.  */
+error_t
+exfat_set_rename (struct exfat_set *set, const struct exfat_name_key *name)
+{
+  uint8_t *stream = set->raw + EXFAT_ENTRY_SIZE;
+  unsigned old_entries = (set->name_length + 14) / 15;
+  unsigned new_entries = (name->length + 14) / 15;
+  unsigned others = set->count - 2 - old_entries;
+
+  if (2 + new_entries + others > EXFAT_SET_MAX)
+    return ENAMETOOLONG;
+  memmove (set->raw + (2 + new_entries) * EXFAT_ENTRY_SIZE,
+	   set->raw + (2 + old_entries) * EXFAT_ENTRY_SIZE,
+	   others * EXFAT_ENTRY_SIZE);
+  memset (set->raw + 2 * EXFAT_ENTRY_SIZE, 0, new_entries * EXFAT_ENTRY_SIZE);
+  for (unsigned i = 0; i < new_entries; i++)
+    set->raw[(2 + i) * EXFAT_ENTRY_SIZE] = EXFAT_TYPE_NAME;
+  for (unsigned i = 0; i < name->length; i++)
+    put_le16 (set->raw + (2 + i / 15) * EXFAT_ENTRY_SIZE + 2 + (i % 15) * 2,
+	      name->name[i]);
+
+  stream[3] = name->length;
+  put_le16 (stream + 4, name->hash);
+  set->count = 2 + new_entries + others;
+  set->name_length = name->length;
+  memcpy (set->name, name->name, name->length * sizeof *name->name);
+  set->name_hash = name->hash;
+  seal_set (set);
+  return 0;
+}
+
+/* Make SET the entry set of a new file called NAME, which META
+   describes.  */
+void
+exfat_set_create (struct exfat_set *set, const struct exfat_name_key *name,
+		  const struct exfat_meta *meta)
+{
+  uint8_t *file = set->raw;
+  uint8_t *stream = set->raw + EXFAT_ENTRY_SIZE;
+  uint32_t stamp;
+
+  memset (set->raw, 0, 2 * EXFAT_ENTRY_SIZE);
+  file[0] = EXFAT_TYPE_FILE;
+  stream[0] = EXFAT_TYPE_STREAM;
+  encode_time (meta->create_time, &stamp, &file[20]);
+  put_le32 (file + 8, stamp);
+  file[22] = 0x80;
+  set->count = 2;
+  set->name_length = 0;
+  exfat_set_rename (set, name);
+  exfat_set_update (set, meta);
+}
+
 
 /* Directories.  */
 
@@ -495,4 +826,41 @@ exfat_dir_next_set (struct exfat_dir *dir, struct exfat_set *set,
       *found = true;
       return 0;
     }
+}
+
+/* Find COUNT unused entries that follow one another in DIR, and set
+   *POS to the offset in the directory of the first.  Return ENOSPC if
+   the directory has to grow to hold them.  */
+error_t
+exfat_dir_find_free (struct exfat_dir *dir, unsigned count, off_t *pos)
+{
+  unsigned run = 0;
+
+  for (off_t at = 0; at + EXFAT_ENTRY_SIZE <= dir->stream->length;
+       at += EXFAT_ENTRY_SIZE)
+    {
+      const uint8_t *e;
+      error_t err = dir_entry (dir, at, &e);
+
+      if (err)
+	return err;
+      if (e[0] == 0)
+	{
+	  /* Section 6.1: every entry from here on is unused as well.  */
+	  off_t start = at - run * EXFAT_ENTRY_SIZE;
+
+	  if ((dir->stream->length - start) / EXFAT_ENTRY_SIZE < count)
+	    return ENOSPC;
+	  *pos = start;
+	  return 0;
+	}
+      if (e[0] & EXFAT_TYPE_IN_USE)
+	run = 0;
+      else if (++run == count)
+	{
+	  *pos = at - (count - 1) * EXFAT_ENTRY_SIZE;
+	  return 0;
+	}
+    }
+  return ENOSPC;
 }
