@@ -455,7 +455,7 @@ void exfat_node_modified (struct node *np);
 error_t exfat_node_write_set (struct node *np, off_t data_length);
 void exfat_node_meta (struct node *np, struct exfat_meta *meta);
 void exfat_write_all_nodes (void);
-bool exfat_orphans_hold_clusters (void);
+bool exfat_nodes_leak_clusters (void);
 error_t exfat_nodes_meet (cluster_t start, cluster_t count, bool *meets);
 
 /* unknown.c */

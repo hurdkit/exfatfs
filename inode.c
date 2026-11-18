@@ -475,12 +475,13 @@ exfat_write_all_nodes (void)
   diskfs_node_iterate (write_one);
 }
 
-/* Return whether a file that is in no directory has clusters: one
-   that was removed while it was open.  Nothing on the volume says
-   whose those clusters are, and they are freed when the file is
-   closed.  */
+/* Return whether a node has clusters that no entry set on the volume
+   records, and that nothing will free once the translator is gone: a
+   file that was removed while it was open, which has its clusters
+   until it is closed, or a file with more clusters than its size
+   takes, because trim_node left it alone or failed.  */
 bool
-exfat_orphans_hold_clusters (void)
+exfat_nodes_leak_clusters (void)
 {
   bool found = false;
 
@@ -488,8 +489,12 @@ exfat_orphans_hold_clusters (void)
     {
       struct exfat_location where;
 
-      if (node->allocsize && exfat_inode_location (node->cache_id, &where)
-	  && !where.set_offset)
+      if (!node->allocsize)
+	return 0;
+      if (exfat_inode_location (node->cache_id, &where) && !where.set_offset)
+	found = true;
+      if (!(node->dn->attributes & EXFAT_ATTR_DIRECTORY)
+	  && node->allocsize > round_cluster (node->dn_stat.st_size))
 	found = true;
       return 0;
     }
