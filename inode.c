@@ -187,13 +187,6 @@ diskfs_node_norefs (struct node *np)
 {
   assert_backtrace (!np->dn->pager);
   exfat_rename_forget (np->cache_id);
-  /* libdiskfs drops only nodes that have no links, and truncates them
-     first.  One that still has clusters is one whose truncate failed:
-     libdiskfs zeroed its allocsize and dropped it all the same.
-     exfat_nodes_leak_clusters does not see it any more, and no entry
-     set records the clusters.  */
-  if (np->dn_stat.st_nlink == 0 && np->dn->stream.length)
-    exfat_volume_damaged ();
   exfat_stream_fini (&np->dn->stream);
   pthread_rwlock_destroy (&np->dn->alloc_lock);
   pthread_mutex_destroy (&np->dn->valid_lock);
@@ -447,13 +440,16 @@ exfat_write_all_nodes (void)
   diskfs_node_iterate (write_one);
 }
 
-/* Return whether a node has clusters that no entry set on the volume
-   records, and that nothing will free once the translator is gone: a
-   file that was removed while it was open, which has its clusters
-   until it is closed, or a file with more clusters than its size
-   takes, because trim_node left it alone or failed.  */
+/* Return whether a file that is in no directory has clusters: one
+   that was removed while it was open, and is still open as the
+   translator is made to go away.  Its set is gone from the volume,
+   which is as if the system had stopped with the file open; the Linux
+   driver leaves VolumeDirty set then, and so does the translator.
+   Clusters that are only leaked, such as those a failed truncate
+   leaves past a file's size, do not count: fsck.exfat neither reports
+   nor frees them, and VolumeDirty would only bring a warning.  */
 bool
-exfat_nodes_leak_clusters (void)
+exfat_orphans_hold_clusters (void)
 {
   bool found = false;
 
@@ -461,12 +457,8 @@ exfat_nodes_leak_clusters (void)
     {
       struct exfat_location where;
 
-      if (!node->allocsize)
-	return 0;
-      if (exfat_inode_location (node->cache_id, &where) && !where.set_offset)
-	found = true;
-      if (!(node->dn->attributes & EXFAT_ATTR_DIRECTORY)
-	  && node->allocsize > round_cluster (node->dn_stat.st_size))
+      if (node->allocsize && exfat_inode_location (node->cache_id, &where)
+	  && !where.set_offset)
 	found = true;
       return 0;
     }

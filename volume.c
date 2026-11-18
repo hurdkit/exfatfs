@@ -139,15 +139,15 @@ exfat_store_flush (void)
 /* Record in the main boot sector that the volume is being written, if
    IN_USE, or that everything written to it is in place.  Section
    3.1.13.2: VolumeDirty is set while the volume may be inconsistent.
-   It stays set when LEAKING says that what is in place leaves
-   clusters allocated that no file on the volume has.  Section 3.1.18:
+   It stays set when ORPHANS says that files removed while open still
+   hold clusters.  Section 3.1.18:
    PercentInUse either follows the bitmap or says that it does not.
    Section 3.1.13.4: ClearToZero is cleared before anything is
    modified.  The boot checksum leaves out both fields, so it stays
    right.  Once the volume has failed, the boot sector stays as it is:
    VolumeDirty is set on the disk by then.  */
 error_t
-exfat_volume_mark (bool in_use, bool leaking)
+exfat_volume_mark (bool in_use, bool orphans)
 {
   error_t err = 0;
   uint8_t sector[4096];
@@ -164,7 +164,7 @@ exfat_volume_mark (bool in_use, bool leaking)
 	err = exfat_disk_read (0, sector, SECTOR_SIZE);
       if (!err)
 	{
-	  bool dirty = in_use || leaking || volume_stays_dirty;
+	  bool dirty = in_use || orphans || volume_stays_dirty;
 
 	  put_le16 (sector + 106,
 		    (get_le16 (sector + 106) & ~(2U | 8U)) | (dirty ? 2 : 0));
