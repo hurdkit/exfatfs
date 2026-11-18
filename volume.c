@@ -146,7 +146,9 @@ exfat_store_flush (void)
    It stays set when LEAKING says that what is in place leaves
    clusters allocated that no file on the volume has.  Section 3.1.18:
    PercentInUse either follows the bitmap or says that it does not.
-   The boot checksum leaves out both fields, so it stays right.  */
+   Section 3.1.13.4: ClearToZero is cleared before anything is
+   modified.  The boot checksum leaves out both fields, so it stays
+   right.  */
 error_t
 exfat_volume_mark (bool in_use, bool leaking)
 {
@@ -166,7 +168,7 @@ exfat_volume_mark (bool in_use, bool leaking)
 	  bool dirty = in_use || leaking || volume_stays_dirty;
 
 	  put_le16 (sector + 106,
-		    (get_le16 (sector + 106) & ~2U) | (dirty ? 2 : 0));
+		    (get_le16 (sector + 106) & ~(2U | 8U)) | (dirty ? 2 : 0));
 	  sector[112] = in_use ? 0xff
 	    : (uint64_t) (vol.cluster_count - exfat_free_clusters) * 100
 	    / vol.cluster_count;
