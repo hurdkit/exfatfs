@@ -1041,6 +1041,42 @@ exfat_dir_next_set (struct exfat_dir *dir, struct exfat_set *set,
     }
 }
 
+/* Free what the sets in DIR that have a benign primary entry hold,
+   for a directory that is deleted.  */
+void
+exfat_dir_free_benign (struct exfat_dir *dir)
+{
+  uint8_t *raw = malloc (EXFAT_SET_MAX * EXFAT_ENTRY_SIZE);
+  const uint8_t *entry;
+
+  if (!raw)
+    return;
+  while (!exfat_dir_next_primary (dir, &entry) && entry)
+    {
+      unsigned count = 1 + entry[1], n;
+
+      if (!(entry[0] & EXFAT_TYPE_BENIGN))
+	{
+	  dir->pos += EXFAT_ENTRY_SIZE;
+	  continue;
+	}
+      memcpy (raw, entry, EXFAT_ENTRY_SIZE);
+      for (n = 1; n < count; n++)
+	{
+	  off_t pos = dir->pos + n * EXFAT_ENTRY_SIZE;
+
+	  if (pos + EXFAT_ENTRY_SIZE > dir->stream->length
+	      || dir_entry (dir, pos, &entry) || !in_use_secondary (entry[0]))
+	    break;
+	  memcpy (raw + n * EXFAT_ENTRY_SIZE, entry, EXFAT_ENTRY_SIZE);
+	}
+      if (n == count)
+	exfat_set_free_unknown (raw, count);
+      dir->pos += n * EXFAT_ENTRY_SIZE;
+    }
+  free (raw);
+}
+
 /* Find COUNT unused entries that follow one another in DIR, and set
    *POS to the offset in the directory of the first.  Return ENOSPC if
    the directory has to grow to hold them.  */

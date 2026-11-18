@@ -591,6 +591,16 @@ diskfs_truncate (struct node *node, loff_t length)
   if (clusters < node->allocsize >> vol.cluster_shift)
     {
       off_t allocated = (off_t) clusters << vol.cluster_shift;
+      struct exfat_dir dir;
+
+      if (directory && !clusters && !st->st_nlink
+	  && !exfat_dir_open (&dir, &dn->stream, false))
+	{
+	  /* The directory is being deleted, and nothing can reach it
+	     any more to change its entries.  */
+	  exfat_dir_free_benign (&dir);
+	  exfat_dir_close (&dir);
+	}
 
       diskfs_set_node_times (node);
       err = exfat_node_write_set (node, directory ? allocated : st->st_size);
